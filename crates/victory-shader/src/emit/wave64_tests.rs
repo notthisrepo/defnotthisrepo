@@ -369,6 +369,20 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     Some(out[0][0])
 }
 
+/// The fewest lanes a wave of the device [`on_the_card`] runs on has, if there is one.
+fn wave_lanes() -> Option<u32> {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1};
+    let host = Host::new(false).ok()?;
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a plain query that fills a structure of the given size.
+    unsafe {
+        host.device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut options).cast(), size_of_val(&options) as u32)
+            .ok()?
+    };
+    Some(options.WaveLaneCountMin)
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack
@@ -394,6 +408,13 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
         v.validate(&mut copy).expect("DXIL validation failed");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // The program is a 32-lane wave's: a device whose waves are narrower
+    // (the software adapter's have 4 lanes) runs it as several waves, and
+    // a ballot of 32 lanes is no mask of one.
+    if let Some(lanes) = wave_lanes().filter(|&lanes| lanes < 32) {
+        eprintln!("the device's waves have {lanes} lanes, fewer than this program's 32; not run");
+        return;
+    }
     for (below, other, expected) in [(32u32, 0u32, u32::MAX), (10, 0, 0x3FF), (0, 0, 0), (10, 1, 5)] {
         let Some(got) = on_the_card(&shader, [below, other]) else { return };
         assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");

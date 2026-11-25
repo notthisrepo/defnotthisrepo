@@ -84,6 +84,24 @@ mod tests {
         );
     }
 
+    /// A title's own end of the process resolves to our logging export,
+    /// never to the host's silent `ExitProcess`.
+    #[test]
+    fn exit_process_resolves_to_hle() {
+        let r = HleResolver::new(HostPolicy::default());
+        for dll in [
+            "kernel32.dll",
+            "kernelbase.dll",
+            "api-ms-win-core-processthreads-l1-1-0.dll",
+        ] {
+            assert_eq!(
+                r.classify(dll, &name("ExitProcess")),
+                Some(Provenance::Hle),
+                "{dll}"
+            );
+        }
+    }
+
     #[test]
     fn strict_policy_reports_missing() {
         let r = HleResolver::new(HostPolicy::none());
@@ -118,6 +136,5 @@ mod tests {
                 &name("GetModuleHandleW")
             ),
             Some(Provenance::Hle)
-        );
-    }
+        );    }
 }

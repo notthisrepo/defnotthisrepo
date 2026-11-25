@@ -1,7 +1,8 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
 //! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! that translated it (the BLAKE3 of the translator's sources), so a changed
+//! translator never serves an old translation and one that did not change
+//! keeps its own through a rebuild. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -18,7 +19,10 @@ use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
-static CACHE: OnceLock<Cache> = OnceLock::new();
+/// Where translated shaders are kept ([`use_shader_cache`]).
+static DIR: OnceLock<PathBuf> = OnceLock::new();
+/// The cache, opened when the first shader asks for it ([`cache`]).
+static CACHE: OnceLock<Option<Cache>> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
@@ -31,20 +35,36 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 /// nothing told them from the new: 8,872 entries and 503 MB after five
 /// builds in an evening, of which one build's 3,000 were of use.
 pub fn use_shader_cache(dir: PathBuf) {
-    let own = build_folder(build());
-    // Opened first: it refuses a folder inside the repository, and nothing
-    // is removed from a place that is not a cache.
-    match Cache::open(dir.join(&own)) {
-        Ok(cache) => {
-            mark_used(&dir.join(&own));
-            let (removed, failed) = prune(&dir, &own);
-            if removed + failed > 0 {
-                tracing::info!(removed, failed, kept = KEPT_BUILDS, "shader cache: folders of other builds let go");
+    let _ = DIR.set(dir);
+}
+
+/// The cache under [`DIR`], opened at the first shader: the folder's name
+/// holds [`build`], which asks the host device what its view heaps hold,
+/// and at the start of a run (when [`use_shader_cache`] is called) there
+/// is no device yet and none should be made for a folder's name.
+fn cache() -> Option<&'static Cache> {
+    CACHE
+        .get_or_init(|| {
+            let dir = DIR.get()?;
+            let own = build_folder(build());
+            // Opened first: it refuses a folder inside the repository, and
+            // nothing is removed from a place that is not a cache.
+            match Cache::open(dir.join(&own)) {
+                Ok(cache) => {
+                    mark_used(&dir.join(&own));
+                    let (removed, failed) = prune(dir, &own);
+                    if removed + failed > 0 {
+                        tracing::info!(removed, failed, kept = KEPT_BUILDS, "shader cache: folders of other builds let go");
+                    }
+                    Some(cache)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no shader cache");
+                    None
+                }
             }
-            let _ = CACHE.set(cache);
-        }
-        Err(e) => tracing::warn!(error = %e, "no shader cache"),
-    }
+        })
+        .as_ref()
 }
 
 /// The builds whose folders are kept, this one included: a release and a
@@ -242,13 +262,13 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// What identifies this translator: the BLAKE3 of its sources, of this
+/// file (the entries' encoding) and of the translation settings it runs
+/// with (the loop limit, which a diagnostics build can change at run time,
+/// and what the host's device said).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -256,41 +276,48 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
+        // The view heap's null slot is part of the translation (it differs
+        // by host GPU): found before it goes into the key, so a translation
+        // cached without the clamp is never served.
+        crate::descriptor::host::probe_view_limit();
+        let mut hash = blake3::Hasher::new();
+        for source in victory_shader::sources().iter().copied().chain([include_str!("shader_cache.rs")]) {
+            hash.update(&(source.len() as u64).to_le_bytes());
+            hash.update(source.as_bytes());
         }
+        hash.update(env!("CARGO_PKG_VERSION").as_bytes());
+        hash.update(&[u8::from(cfg!(feature = "diagnostics"))]);
+        for n in [
+            limit,
+            victory_shader::emit::view_heap_limit(),
+            victory_shader::emit::host_max_wave(),
+            // Which group barriers wait is part of the translation too.
+            u32::from(victory_shader::emit::group_sync()),
+            // And which clean-up passes ran over the translated code.
+            victory_shader::emit::shader_opt(),
+        ] {
+            hash.update(&n.to_le_bytes());
+        }
+        // So are the switches that pick the form of a wave64 program:
+        // without them here a run with `VICTORY_WAVE_WIDE=0` was served
+        // the translations an earlier run had cached with the switch unset.
+        for name in [
+            "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_WAVE_LOCAL",
+            "VICTORY_F16_NEAREST",
+            "VICTORY_STRICT_JOINS",
+            "VICTORY_MESH_OUTPUT_STRICT",
+        ] {
+            hash.update(name.as_bytes());
+            hash.update(b"=");
+            if let Some(value) = std::env::var_os(name) {
+                hash.update(value.as_encoded_bytes());
+            }
+            hash.update(&[0]);
+        }
+        *hash.finalize().as_bytes()
     })
 }
 
@@ -298,7 +325,7 @@ fn build() -> &'static [u8; 32] {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    match cache() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
     }

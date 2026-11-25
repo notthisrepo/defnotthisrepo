@@ -229,29 +229,75 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
     }
 }
 
+/// The line logged when the title ends the process, and the code the host
+/// then exits with. A function so the text and the code are tested without
+/// ending the test process.
+fn title_exit(call: &str, code: u32, from: &str) -> (String, i32) {
+    (
+        format!("title ended the process: call {call}, code {code}, from {from}"),
+        code as i32,
+    )
+}
+
+/// Puts the line on disk before the process goes: the log writes to the
+/// standard error, which is unbuffered, but a flush says so.
+fn flush_log() {
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+}
+
+/// Logs a title-chosen exit and returns the code the host exits with.
+fn log_title_exit(call: &str, code: u32, from: &str) -> i32 {
+    let (line, code) = title_exit(call, code, from);
+    tracing::warn!("{line}");
+    flush_log();
+    code
+}
+
 /// The CRT's `exit`, through which the title's entry point returns: logs
 /// the code and the caller, then exits on the host.
 pub extern "C" fn exit(code: i32) -> ! {
-    tracing::warn!(code, from = %host::callers(), "title exits");
-    host::exit(code)
+    let from = host::callers();
+    host::exit(log_title_exit("exit", code as u32, &from))
 }
 
-/// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
+/// The kernel's `ExitProcess`: logged as [`exit`] is, then the host's own
+/// with the title's code (without this export it was bound silently).
+/// Not the CRT's `exit`: that runs the exit table on the calling thread
+/// while the title's other threads live, where an exit function waiting
+/// for a lock the caller or another thread holds hung the process before
+/// anything ended it. Windows ends the other threads first and runs no
+/// exit table of the program; its loader detaches the DLLs it loaded.
+/// shortcut: title images we mapped get no `DLL_PROCESS_DETACH` this way
+/// (`victory_loader`'s detach runs from the CRT's exit only): a title that
+/// needs its images' detach code at a direct `ExitProcess` would need it
+/// called here after the other threads end.
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    let from = host::callers();
+    log_title_exit("ExitProcess", code, &from);
+    host::exit_process(code)
+}
+
+/// The CRT's `abort` (also reached from `terminate`): logged like [`exit`],
+/// with the CRT's abort code.
 pub extern "C" fn abort() -> ! {
-    tracing::error!(from = %host::callers(), "title aborts");
+    let from = host::callers();
+    log_title_exit("abort", 3, &from);
     host::abort()
 }
 
 /// The CRT's `terminate` and the STL's invalid-argument exit: logged, then
 /// the host's `abort`.
 pub extern "C" fn terminate() -> ! {
-    tracing::error!(from = %host::callers(), "title calls terminate");
+    let from = host::callers();
+    log_title_exit("terminate", 3, &from);
     host::abort()
 }
 
 /// See [`terminate`].
 pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
-    tracing::error!(from = %host::callers(), "title passed an invalid parameter");
+    let from = host::callers();
+    log_title_exit("_invalid_parameter_noinfo_noreturn", 3, &from);
     host::abort()
 }
 
@@ -280,7 +326,8 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 /// See [`exit`]; only the current process is logged.
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
-        tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        let from = host::callers();
+        log_title_exit("TerminateProcess", code, &from);
     }
     host::terminate_process(process, code)
 }
@@ -377,6 +424,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(OutputDebugStringA),
             hle_export!(OutputDebugStringW),
             hle_export!(exit),
+            hle_export!(ExitProcess),
             hle_export!(abort),
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
@@ -476,6 +524,11 @@ mod host {
         unsafe { crt_exit(code) }
     }
 
+    pub(super) fn exit_process(code: u32) -> ! {
+        // SAFETY: see above.
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(code) }
+    }
+
     pub(super) fn abort() -> ! {
         // SAFETY: see above.
         unsafe { crt_abort() }
@@ -573,6 +626,10 @@ mod host {
         std::process::exit(code)
     }
 
+    pub(super) fn exit_process(code: u32) -> ! {
+        std::process::exit(code as i32)
+    }
+
     pub(super) fn abort() -> ! {
         std::process::abort()
     }
@@ -595,6 +652,75 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title-chosen exit's line names the call, the code and the caller,
+    /// and the code the host exits with. The text is the one the harness
+    /// matches, so it is fixed.
+    #[test]
+    fn a_title_exit_line_names_the_call_code_and_caller() {
+        assert_eq!(
+            title_exit("exit", 127, "game.exe+0x1234"),
+            (
+                "title ended the process: call exit, code 127, from game.exe+0x1234".to_owned(),
+                127
+            )
+        );
+        // An exit code that arrives as a negative i32 keeps its bits.
+        assert_eq!(title_exit("exit", (-1i32) as u32, "").1, -1);
+    }
+
+    /// The title's `ExitProcess` ends the process as Windows does: the
+    /// CRT's exit table does not run on the calling thread while the
+    /// title's other threads live, and the process ends with the title's
+    /// code. Through the CRT's `exit` instead, an exit function that wants
+    /// a lock the caller holds hung the process before anything else ran
+    /// (Sol, integration review). A child process of this test binary
+    /// makes that call; the test waits for it at most 30 seconds.
+    #[cfg(windows)]
+    #[test]
+    fn a_title_exit_process_ends_as_windows_does_with_its_code() {
+        const CHILD: &str = "VICTORY_TEST_EXIT_PROCESS_CHILD";
+        const CODE: u32 = 0x8765_4321;
+        if std::env::var_os(CHILD).is_some() {
+            static HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            extern "C" fn wants_the_lock() {
+                drop(HELD.lock());
+            }
+            unsafe extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            let _held = HELD.lock().unwrap();
+            // SAFETY: registers a function with the CRT's exit table.
+            assert_eq!(unsafe { atexit(wants_the_lock) }, 0);
+            // Another thread alive, as the title's are.
+            drop(std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }));
+            ExitProcess(CODE);
+        }
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .args(["--exact", "modules::kernel::tests::a_title_exit_process_ends_as_windows_does_with_its_code", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("the title's ExitProcess did not end the process in 30 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(status.code().map(|c| c as u32), Some(CODE), "the title's code");
+    }
 
     #[test]
     fn title_images_report_their_original_path() {

@@ -5,6 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -104,6 +105,60 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     let now = self::moment();
     let tenths = (now & 0xffff_ffff).saturating_sub(moment & 0xffff_ffff);
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
+}
+
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullAvailPhys)
+}
+
+/// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
+/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
+/// handles not yet recorded into a list or slot remain protected.
+pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+    const NORMAL_MS: u64 = 5_000;
+    const MODERATE_MS: u64 = 2_500;
+    const HIGH_MS: u64 = 1_000;
+    let Some([budget, used, ..]) = video_memory else {
+        return NORMAL_MS;
+    };
+    if budget == 0 {
+        return NORMAL_MS;
+    }
+    let used_pct = (u128::from(used) * 100) / u128::from(budget);
+    if used_pct >= 85 {
+        HIGH_MS
+    } else if used_pct >= 75 {
+        MODERATE_MS
+    } else {
+        NORMAL_MS
+    }
+}
+
+/// Effective idle timeout (in milliseconds) for system-RAM caches (staging
+/// buffers, loose shadows, and the mapped pipeline library), scaled down
+/// when free physical RAM is low. Never returns less than 2,000 ms.
+pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const NORMAL_MS: u64 = 10_000;
+    const MODERATE_MS: u64 = 5_000;
+    const HIGH_MS: u64 = 2_000;
+    let Some(avail) = avail_phys else {
+        return NORMAL_MS;
+    };
+    if avail < 2 * GIB {
+        HIGH_MS
+    } else if avail < 4 * GIB {
+        MODERATE_MS
+    } else {
+        NORMAL_MS
+    }
 }
 
 /// How many references are held on a host object (its COM count): ours
@@ -559,7 +614,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if on_warp() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -733,6 +788,12 @@ mod adapter_tests {
     }
 }
 
+/// Whether the host device is the software adapter (WARP): diagnostics
+/// builds with `VICTORY_D3D12_WARP`.
+pub(crate) fn on_warp() -> bool {
+    cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -793,6 +854,32 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_caption_ends_with_how_long_the_process_has_run() {
+        use super::{Duration, caption};
+
+        let figures = "ZSlayerHQ GTA 6 | 1 fps 953.5 ms/frame | 1526 draws/frame";
+        let up = |secs| caption(figures, Duration::from_secs(secs));
+        assert_eq!(up(0), format!("{figures} | up 0:00"));
+        assert_eq!(up(59), format!("{figures} | up 0:59"));
+        assert_eq!(up(754), format!("{figures} | up 12:34"));
+        assert_eq!(up(3723), format!("{figures} | up 1:02:03"));
+    }
+
+    #[test]
+    fn the_running_time_counts_from_the_process_start_and_moves_on() {
+        use super::{Duration, process_age, process_uptime};
+
+        // The test process was created before this test ran, and not long ago.
+        let age = process_age().expect("the kernel's creation time");
+        assert!(age > Duration::ZERO && age < Duration::from_secs(3600), "{age:?}");
+        let first = process_uptime();
+        std::thread::sleep(Duration::from_millis(20));
+        let later = process_uptime();
+        assert!(first >= age, "{first:?} is before the process's age {age:?}");
+        assert!(later >= first + Duration::from_millis(20), "{first:?} then {later:?}");
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -1706,10 +1793,15 @@ struct Deferred {
     /// Textures read back (texture to buffer copies), done once the list
     /// has run: the host buffer the list copies the texels into, the title
     /// memory they go to, the bytes of a row, the rows, the title's row
-    /// pitch.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// pitch; and, for the walls trace only, the title texture read and
+    /// the frame the copy was recorded in.
+    backs: Vec<(ID3D12Resource, usize, [usize; 3], usize, u64)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Work once the list has run (diagnostics: what read-back buffers
+    /// hold, `HostList::defer_after`).
+    #[cfg(feature = "diagnostics")]
+    after: Vec<Box<dyn Fn() + Send>>,
 }
 
 impl Deferred {
@@ -1885,7 +1977,10 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    // Stage 2 unless `VICTORY_RELAY=1` asks for the first one (the default
+    // since the walls of the first room were found drawn in every run with
+    // this set and in fewer than half without it).
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -1975,7 +2070,10 @@ mod relay_tests {
 }
 
 /// The most host lists in the air before the flights are settled
-/// (`VICTORY_LATE_WAIT_LISTS`, 128; 32 settled the flights three times a
+/// (`VICTORY_LATE_WAIT_LISTS`, 256; `=128` is the value before: with the
+/// relay it stopped the submitting thread twice a frame for 92-103 ms in
+/// all while the card stood idle 64-113 ms a frame, runs 158, 159 and 162;
+/// 32 settled the flights three times a
 /// frame in run 92 and 64 still 1.3-1.7 times in run 99, with 12,919 tables
 /// asked and none refused; watch "tables asked, N refused"): their dynamic
 /// descriptor slots, upload
@@ -1984,7 +2082,7 @@ mod relay_tests {
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128).max(1)
+        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
     })
 }
 
@@ -2742,6 +2840,19 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     back
 }
 
+/// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
+/// lines that say what the title's CPU was given while it decided whether
+/// the camera is in a room. The values of the small read-backs
+/// ([`read_backs`]), the frame's main pass by scissor rectangle with its
+/// culling dispatches (`draw.rs`, `walls_census`), the shader-written
+/// buffers merged into title memory (`shadow.rs`, `walls_merged`), host
+/// copies found stale after their refresh (`shadow.rs`), and, in the
+/// runtime, the read requests that fail (with 2: every request).
+pub(crate) fn walls_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2"))
+}
+
 /// After `list` has run: the texels its read-backs copied into host
 /// buffers of ours go to the title's memory (`HostList::defer_read_back`).
 ///
@@ -2750,7 +2861,12 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    #[cfg(feature = "diagnostics")]
+    for work in &list.deferred().after {
+        work();
+    }
+    for (buffer, at, [row, rows, pitch], source, recorded) in &list.deferred().backs {
+        let mut landed = false;
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -2761,9 +2877,177 @@ fn read_backs(list: &HostList) {
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
+                // The walls trace: what the title is handed (one row of at
+                // most 24 values: its 5x1 and 1x1 float targets).
+                if walls_trace() && *rows == 1 && *row <= 96 {
+                    let mut values = [0f32; 24];
+                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
+                    tracing::info!(
+                        frame = crate::frame::current(),
+                        to = format_args!("{:#x}", *at),
+                        bytes = *row,
+                        values = ?&values[..*row / 4],
+                        "walls trace: a read-back lands in title memory"
+                    );
+                }
                 buffer.Unmap(0, None);
+                landed = true;
             }
         }
+        let bytes = row * rows;
+        walls_landed(READ_BACK, *at, pitch * (rows - 1) + row, bytes, if landed { bytes } else { 0 }, *source, Some(*recorded));
+    }
+}
+
+/// The walls trace's kinds of what reaches title memory from the card.
+pub(crate) const READ_BACK: &str = "read-back";
+pub(crate) const CARD_COPY: &str = "card copy";
+pub(crate) const HOST_COPY: &str = "host copy";
+
+/// The walls trace: one line a frame of what the card wrote that reached
+/// title memory in it, each summed per kind and destination. It lists
+/// every read-back, with the title texture it copies and the frame it was
+/// recorded in, and every card copy merged back and host copy shaders
+/// changed (those compared and found unchanged only counted). It shows
+/// when the results of a pass the title's CPU reads, such as the depth
+/// pyramid it tests occlusion against, reach the title, against the
+/// frame its scissor rectangle first narrows. Logging only.
+pub(crate) fn walls_landed(kind: &'static str, at: usize, len: usize, bytes: usize, written: usize, source: usize, recorded: Option<u64>) {
+    if !walls_trace() {
+        return;
+    }
+    static LANDINGS: Mutex<Option<Landings>> = Mutex::new(None);
+    let line = LANDINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Landings::default)
+        .add(crate::frame::current(), kind, at, len, bytes, written, source, recorded);
+    if let Some((frame, count, unchanged, landed)) = line {
+        tracing::info!(
+            frame,
+            count,
+            unchanged,
+            landed = ?landed,
+            "walls trace: what the card wrote reached title memory in this frame"
+        );
+    }
+}
+
+/// One frame's [`walls_landed`].
+#[derive(Default)]
+struct Landings {
+    frame: u64,
+    entries: std::collections::BTreeMap<(&'static str, usize), Landing>,
+    /// Copies compared and found unchanged.
+    unchanged: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Landing {
+    len: usize,
+    count: u32,
+    bytes: u64,
+    written: u64,
+    source: usize,
+    /// The earliest frame one was recorded in, for read-backs.
+    recorded: Option<u64>,
+}
+
+impl Landings {
+    /// Notes one in `frame`; if it is the first of a new frame, the line of
+    /// the frame before: its number, its entries, how many were unchanged,
+    /// and the entries (at most 256).
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        frame: u64,
+        kind: &'static str,
+        at: usize,
+        len: usize,
+        bytes: usize,
+        written: usize,
+        source: usize,
+        recorded: Option<u64>,
+    ) -> Option<(u64, usize, u64, Vec<String>)> {
+        let line = if self.frame == frame { None } else { self.take() };
+        self.frame = frame;
+        if written == 0 && kind != READ_BACK {
+            self.unchanged += 1;
+            return line;
+        }
+        let e = self.entries.entry((kind, at)).or_insert(Landing {
+            len,
+            count: 0,
+            bytes: 0,
+            written: 0,
+            source,
+            recorded,
+        });
+        e.len = e.len.max(len);
+        e.count += 1;
+        e.bytes += bytes as u64;
+        e.written += written as u64;
+        e.recorded = match (e.recorded, recorded) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        line
+    }
+
+    /// The line of the frame noted so far, if anything was noted.
+    fn take(&mut self) -> Option<(u64, usize, u64, Vec<String>)> {
+        if self.entries.is_empty() && self.unchanged == 0 {
+            return None;
+        }
+        let landed = self
+            .entries
+            .iter()
+            .take(256)
+            .map(|((kind, at), l)| {
+                let mut s = format!("{kind} {at:#x}+{:#x}: x{}, {} bytes, {} written", l.len, l.count, l.bytes, l.written);
+                if l.source != 0 {
+                    s += &format!(", from {:#x}", l.source);
+                }
+                if let Some(r) = l.recorded {
+                    s += &format!(", recorded in frame {r}");
+                }
+                s
+            })
+            .collect();
+        let line = (self.frame, self.entries.len(), self.unchanged, landed);
+        self.entries.clear();
+        self.unchanged = 0;
+        Some(line)
+    }
+}
+
+#[cfg(test)]
+mod landings_tests {
+    use super::{CARD_COPY, HOST_COPY, Landings, READ_BACK};
+
+    /// A frame's line comes when the next frame's first landing does: read
+    /// backs summed per destination with their texture and the earliest
+    /// frame they were recorded in, a card copy merged back, and a host
+    /// copy found unchanged only counted.
+    #[test]
+    fn a_frames_landings_are_one_line_once_the_next_frame_begins() {
+        let mut l = Landings::default();
+        assert!(l.add(5, READ_BACK, 0x1000, 0x200, 0x100, 0x100, 0xabc, Some(4)).is_none());
+        assert!(l.add(5, READ_BACK, 0x1000, 0x200, 0x100, 0x100, 0xabc, Some(3)).is_none());
+        assert!(l.add(5, CARD_COPY, 0x2000, 0x40, 0x40, 0x10, 0, None).is_none());
+        assert!(l.add(5, HOST_COPY, 0x3000, 0x40, 0x40, 0, 0, None).is_none());
+        let (frame, count, unchanged, landed) = l.add(6, CARD_COPY, 0x2000, 0x40, 0x40, 0x40, 0, None).expect("frame 5's line");
+        assert_eq!((frame, count, unchanged), (5, 2, 1));
+        assert_eq!(
+            landed,
+            [
+                "card copy 0x2000+0x40: x1, 64 bytes, 16 written",
+                "read-back 0x1000+0x200: x2, 512 bytes, 512 written, from 0xabc, recorded in frame 3",
+            ]
+        );
+        // Frame 6 holds its own.
+        assert_eq!(l.take().map(|t| (t.0, t.1)), Some((6, 1)));
+        assert!(l.take().is_none());
     }
 }
 
@@ -2796,6 +3080,7 @@ fn hand_back(back: &[Declared]) {
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
+            walls_landed(HOST_COPY, *from, to - from, to - from, written, 0, None);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
@@ -2828,6 +3113,7 @@ fn hand_back(back: &[Declared]) {
         }
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
+            walls_landed(HOST_COPY, from, to - from, to - from, written, 0, None);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
@@ -2869,6 +3155,27 @@ impl Host {
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
             tracing::info!(mesh, "host mesh shader support");
             mesh
+        })
+    }
+
+    /// Whether the host GPU supports the depth bounds test; logged once.
+    pub(crate) fn depth_bounds(&self) -> bool {
+        static BOUNDS: OnceLock<bool> = OnceLock::new();
+        *BOUNDS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            tracing::info!(supported, "host depth bounds support");
+            supported
         })
     }
 
@@ -3453,7 +3760,9 @@ impl Host {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            shadow.walls_merged(gpu.len(), merged);
+            written += merged;
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
@@ -3699,7 +4008,9 @@ impl Host {
                                 // the copy into it has run, and the caller
                                 // waits for this job.
                                 let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
-                                counts[i].fetch_add(shadow.card_merge(lo, gpu, &mut title), Ordering::Relaxed);
+                                let merged = shadow.card_merge(lo, gpu, &mut title);
+                                shadow.walls_merged(gpu.len(), merged);
+                                counts[i].fetch_add(merged, Ordering::Relaxed);
                             }
                         }) as Box<dyn FnOnce() + Send>
                     })
@@ -3714,7 +4025,9 @@ impl Host {
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run.
                     let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
-                    written[i] += plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
+                    written[i] += merged;
                 }
             }
         }
@@ -5063,8 +5376,16 @@ impl HostList {
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3], source: crate::object::This) {
+        let recorded = crate::frame::current();
+        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch], source as usize, recorded));
+    }
+
+    /// Runs `work` once the list has run, with its read-backs
+    /// (diagnostics: logging what a read-back buffer of ours holds).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -5764,6 +6085,110 @@ struct Presenter {
     overlay: Vec<Option<(ID3D12Resource, usize, u64)>>,
 }
 
+/// The process's CPU time in microseconds, kernel and user.
+#[cfg(windows)]
+fn process_cpu_us() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    // SAFETY: plain C structs, zero is a valid value for each.
+    let (mut creation, mut exit, mut kernel, mut user) = unsafe {
+        (
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+        )
+    };
+    // SAFETY: the current-process pseudo handle and four writable FILETIMEs.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let ticks = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    Some((ticks(kernel) + ticks(user)) / 10)
+}
+
+/// The process's working set in bytes.
+#[cfg(windows)]
+fn process_working_set() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: a plain C struct, zero is a valid value.
+    let mut counters = unsafe { std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>() };
+    // SAFETY: the current-process pseudo handle and a counter of the size passed.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    (ok != 0).then_some(counters.WorkingSetSize as u64)
+}
+
+/// The machine's logical processors.
+#[cfg(windows)]
+fn logical_processors() -> u32 {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // SAFETY: the call fills the plain struct.
+    let mut info = unsafe { std::mem::zeroed::<SYSTEM_INFO>() };
+    // SAFETY: as above.
+    unsafe { GetSystemInfo(&mut info) };
+    info.dwNumberOfProcessors.max(1)
+}
+
+/// How long ago the kernel created this process.
+#[cfg(windows)]
+fn process_age() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    // A FILETIME counts 100 ns from 1601; the Unix epoch is this many later.
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    // SAFETY: plain C structs, zero is a valid value for each.
+    let mut times = unsafe { std::mem::zeroed::<[FILETIME; 4]>() };
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the current-process pseudo handle and four writable FILETIMEs.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), creation, exit, kernel, user) } == 0 {
+        return None;
+    }
+    let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    let created = Duration::from_nanos(ticks.checked_sub(UNIX_EPOCH_TICKS)?.checked_mul(100)?);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .checked_sub(created)
+}
+
+/// How long the process has been running: its age when first asked, plus the
+/// time since, so the wall clock being set does not move it.
+fn process_uptime() -> Duration {
+    static FIRST: std::sync::OnceLock<(Instant, Duration)> = std::sync::OnceLock::new();
+    let (at, age) = *FIRST.get_or_init(|| (Instant::now(), process_age().unwrap_or_default()));
+    age + at.elapsed()
+}
+
+/// The window's caption: the meter's figures, then how long the process has
+/// run, as minutes and seconds, with hours once there are any.
+fn caption(figures: &str, up: Duration) -> String {
+    let s = up.as_secs();
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h == 0 {
+        format!("{figures} | up {m}:{s:02}")
+    } else {
+        format!("{figures} | up {h}:{m:02}:{s:02}")
+    }
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -5773,8 +6198,14 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
-    /// The caption the window had, once read.
-    caption: Option<Vec<u16>>,
+    /// Process CPU time at the last report (microseconds).
+    cpu_us: u64,
+    /// Percent of the machine's CPU over the last report.
+    cpu_pct: f64,
+    /// Percent of the frame time the GPU was busy.
+    gpu_pct: f64,
+    /// Working set in MB.
+    ram_mb: f64,
     /// Host buffers made ([`MADE`]) when the overlay's figures were last
     /// given: the next ones say how many were made since.
     made: u64,
@@ -5790,7 +6221,10 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
-            caption: None,
+            cpu_us: process_cpu_us().unwrap_or(0),
+            cpu_pct: 0.0,
+            gpu_pct: 0.0,
+            ram_mb: 0.0,
             made: 0,
         }
     }
@@ -5820,6 +6254,20 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        // Process CPU share of the whole machine, GPU busy share of the frame,
+        // and the process's working set.
+        self.cpu_pct = {
+            let now = process_cpu_us().unwrap_or(self.cpu_us);
+            let pct = (now.saturating_sub(self.cpu_us)) as f64
+                / 1e6
+                / elapsed.as_secs_f64()
+                / f64::from(logical_processors())
+                * 100.0;
+            self.cpu_us = now;
+            pct
+        };
+        self.gpu_pct = if ms > 0.0 { gpu / ms * 100.0 } else { 0.0 };
+        self.ram_mb = process_working_set().unwrap_or(0) as f64 / (1024.0 * 1024.0);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -5944,6 +6392,12 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             {
+                let [same, changed, waiting] =
+                    [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "textures picked by index, looked at again after their upload: {same} looks found them unchanged, \
+                     {changed} changed (uploaded again), {waiting} wait for a look"
+                );
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =
@@ -5967,6 +6421,15 @@ impl Meter {
                     crate::descriptor::host::WIDENED[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                );
+                let [views, shown, waiting, tables, gone, own, free, start, other, shows, back] =
+                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|i: usize| crate::descriptor::host::SWEPT[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "placed texture views in the heap at the last look: {views}, of them {shown} shown, {waiting} in the queue, \
+                     {tables} read through tables, {gone} without memory; with memory and nothing to bring them up to date: \
+                     {own} of their own memory, {free} of memory no other view describes, {start} of memory another texture \
+                     begins at, {other} of another's memory ({shows} of all these show another view); {back} put back into the \
+                     queue since the start"
                 );
             }
             #[cfg(feature = "diagnostics")]
@@ -6001,7 +6464,8 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                 cpu {cpu_pct:.1}% gpu {gpu_pct:.0}% busy ram {ram_mb:.0} MB",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -6020,7 +6484,10 @@ impl Meter {
                 ),
                 making = crate::pipeline::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
-                objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
+                objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed),
+                cpu_pct = self.cpu_pct,
+                gpu_pct = self.gpu_pct,
+                ram_mb = self.ram_mb
             );
             #[cfg(feature = "diagnostics")]
             {
@@ -6033,37 +6500,41 @@ impl Meter {
                 }
             }
         }
-        if self.caption.is_none() {
-            // The window's own text, read without a message.
-            let mut buffer = vec![0u16; 512];
-            // SAFETY: a window handle and a buffer of that length.
-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
-            buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
-        }
-        let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
-        text.push(0);
+        let (cpu_pct, gpu_pct, ram_mb) = (self.cpu_pct, self.gpu_pct, self.ram_mb);
+        let text = format!(
+            "ZSlayerHQ GTA 6 | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
+             cpu {cpu_pct:.0}% ram {ram_mb:.0} MB | {draws:.0} draws/frame"
+        );
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
-        // presenting never waits; it takes the newest text when free.
-        static PENDING: Mutex<Option<(usize, Vec<u16>)>> = Mutex::new(None);
+        // presenting never waits; it takes the newest figures when free, and
+        // keeps the running time moving while frames are slow or absent.
+        static PENDING: Mutex<Option<(usize, String)>> = Mutex::new(None);
         static SETTER: std::sync::Once = std::sync::Once::new();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
         SETTER.call_once(|| {
             let _ = std::thread::Builder::new()
                 .name("victory-caption".into())
                 .spawn(|| {
+                    let (mut newest, mut shown) = (None, String::new());
                     loop {
                         let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        match next {
-                            // SAFETY: a window handle and a NUL-terminated text.
-                            Some((hwnd, text)) => unsafe {
-                                let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
-                            },
-                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                        newest = next.or(newest);
+                        if let Some((hwnd, figures)) = &newest {
+                            let text = caption(figures, process_uptime());
+                            if text != shown {
+                                let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+                                // SAFETY: a window handle and a NUL-terminated text.
+                                unsafe {
+                                    let _ = SetWindowTextW(
+                                        HWND(*hwnd as *mut _),
+                                        PCWSTR(wide.as_ptr()),
+                                    );
+                                }
+                                shown = text;
+                            }
                         }
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 });
         });
@@ -6102,7 +6573,17 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    (p.width, p.height, p.format) = (width, height, format);
+                    tracing::info!(
+                        width,
+                        height,
+                        format = format.0,
+                        frame,
+                        "the swap chain's buffers were made again for another size or format"
+                    );
+                    self.log_video_memory("right after the swap chain's buffers were made again");
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
@@ -6278,6 +6759,7 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -6300,6 +6782,7 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
                 width,
@@ -6380,7 +6863,69 @@ impl Host {
                 .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
                 .ok()?;
         }
+        // The card's budget moved by 256 MB or more since the last look:
+        // said at once, with what was in use at the last look, so the log
+        // has the moment. (It fell from 11,242 MB to some 10,300 MB with
+        // the first world frame in runs 179 to 185, and the memory line,
+        // seconds later, was the first to show it. We reserve nothing
+        // and make the swap chain once, at the start.)
+        static LAST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+        let now = [own.Budget, own.CurrentUsage, shared.CurrentUsage];
+        let last = [0, 1, 2].map(|i| LAST[i].swap(now[i], Ordering::Relaxed));
+        if last[0] != 0 && last[0].abs_diff(own.Budget) >= (256u64 << 20) {
+            tracing::info!(
+                "the system changed the budget of the card's memory from {} MB to {} MB (frame {}); at the last look {} MB of the card's and {} MB of the PC's shared memory were in use",
+                last[0] >> 20,
+                own.Budget >> 20,
+                crate::frame::current(),
+                last[1] >> 20,
+                last[2] >> 20
+            );
+            self.log_video_memory("right after that change");
+        }
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// Both of the system's memory groups for this process, in bytes: for
+    /// the card's own memory and then for the PC's memory shared with the
+    /// card, the budget, the use, what could still be reserved and what
+    /// is reserved (the layer reserves none).
+    pub(crate) fn video_memory_groups(&self) -> Option<[[u64; 4]; 2]> {
+        let adapter = self.adapter.as_ref()?;
+        let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: plain queries that fill our structures.
+        unsafe {
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
+                .ok()?;
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
+                .ok()?;
+        }
+        let all = |m: &DXGI_QUERY_VIDEO_MEMORY_INFO| {
+            [m.Budget, m.CurrentUsage, m.AvailableForReservation, m.CurrentReservation]
+        };
+        Some([all(&own), all(&shared)])
+    }
+
+    /// Logs [`Self::video_memory_groups`], with `when` it is said.
+    pub(crate) fn log_video_memory(&self, when: &str) {
+        let Some([own, shared]) = self.video_memory_groups() else {
+            return;
+        };
+        tracing::info!(
+            "video memory as the system counts it, {}: the card's own: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved; the PC's shared with the card: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved (the layer reserves none)",
+            when,
+            own[0] >> 20,
+            own[1] >> 20,
+            own[2] >> 20,
+            own[3] >> 20,
+            shared[0] >> 20,
+            shared[1] >> 20,
+            shared[2] >> 20,
+            shared[3] >> 20
+        );
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
@@ -6766,5 +7311,41 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn vram_idle_ms_scales_with_pressure() {
+        use super::vram_idle_ms;
+        let gib = 1024 * 1024 * 1024;
+        // Normal (< 75%)
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
+        // Moderate (75%..85%)
+        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
+        // High (>= 85%, including over-budget)
+        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+        // Missing or zero budget falls back to normal
+        assert_eq!(vram_idle_ms(None), 5_000);
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    #[test]
+    fn ram_idle_ms_scales_with_pressure() {
+        use super::ram_idle_ms;
+        let gib = 1024 * 1024 * 1024;
+        // Normal (>= 4 GiB)
+        assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
+        assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);
+        // Moderate (2 GiB..4 GiB)
+        assert_eq!(ram_idle_ms(Some(4 * gib - 1)), 5_000);
+        assert_eq!(ram_idle_ms(Some(2 * gib)), 5_000);
+        // High (< 2 GiB)
+        assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 2_000);
+        assert_eq!(ram_idle_ms(Some(0)), 2_000);
+        // Missing falls back to normal
+        assert_eq!(ram_idle_ms(None), 10_000);
     }
 }

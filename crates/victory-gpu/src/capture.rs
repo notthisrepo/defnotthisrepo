@@ -17,7 +17,8 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// too, and their draws traced at debug level. `VICTORY_CAPTURE_HEAVY_FRAMES`
+/// lists frames counted from the heavy scene's first ([`heavy_frame`]).
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
@@ -47,7 +48,50 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after)) || heavy_listed(n)
+}
+
+/// `VICTORY_CAPTURE_HEAVY_FRAMES` (comma-separated): frames counted from
+/// the heavy scene's first, whose number differs from build to build.
+fn heavy_offsets() -> &'static [u64] {
+    static OFFSETS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        let list = std::env::var("VICTORY_CAPTURE_HEAVY_FRAMES").unwrap_or_default();
+        list.split(',').filter_map(|f| f.trim().parse().ok()).collect()
+    })
+}
+
+/// The heavy scene's first presented frame, once seen.
+#[derive(Debug, Default)]
+struct Heavy {
+    first: Option<u64>,
+}
+
+static HEAVY: std::sync::Mutex<Heavy> = std::sync::Mutex::new(Heavy { first: None });
+
+/// The title draws and mesh dispatches a frame records, run or dropped
+/// (`crate::draw::attempted`), that make it the heavy scene's first.
+const HEAVY_ATTEMPTS: u64 = 1_000;
+
+/// One presented frame against the heavy list: `attempts` is the title
+/// draws and mesh dispatches it recorded, whether they ran or were dropped
+/// (never compute dispatches: counted only when dropped, they made a
+/// compute-heavy frame heavy on one build and not on another, Sol's
+/// review), `state` the frames so far. Sets the scene's first frame when
+/// this one reaches [`HEAVY_ATTEMPTS`], and returns whether `n` is one of
+/// the listed frames after it.
+fn heavy_frame(n: u64, attempts: u64, state: &mut Heavy, offsets: &[u64]) -> bool {
+    if state.first.is_none() && attempts >= HEAVY_ATTEMPTS {
+        state.first = Some(n);
+    }
+    state.first.is_some_and(|first| offsets.iter().any(|&k| first.saturating_add(k) == n))
+}
+
+/// Whether `n` is one of `VICTORY_CAPTURE_HEAVY_FRAMES` after the heavy
+/// scene's first frame; before that frame nothing is.
+fn heavy_listed(n: u64) -> bool {
+    let offsets = heavy_offsets();
+    !offsets.is_empty() && heavy_frame(n, 0, &mut HEAVY.lock().unwrap_or_else(|e| e.into_inner()), offsets)
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -127,6 +171,18 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempted = crate::draw::attempted();
+    let attempts = attempted.saturating_sub(LAST_ATTEMPTS.swap(attempted, Relaxed));
+    let offsets = heavy_offsets();
+    if !offsets.is_empty() {
+        let mut heavy = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+        let before = heavy.first;
+        heavy_frame(frame, attempts, &mut heavy, offsets);
+        if before.is_none() && heavy.first.is_some() {
+            tracing::info!(frame, attempts, "the heavy scene's first frame (VICTORY_CAPTURE_HEAVY_FRAMES counts from it)");
+        }
+    }
     let before = LAST.swap(drawn, Relaxed);
     if world_on()
         && drawn.saturating_sub(before) >= 500
@@ -142,16 +198,248 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
 }
 
+/// Whether the frame being recorded is listed and a folder is set: then
+/// indirect executions' records are read ([`read_indirect`]).
+pub(crate) fn recording_listed() -> bool {
+    folder().is_some() && listed(crate::queue::presented() + 1)
+}
+
+/// Where an indirect execution's records are.
+pub(crate) enum Records<'a> {
+    /// In the argument clamp's scratch buffer at an offset, in the
+    /// indirect-argument state (`crate::indirect::bound`).
+    Clamped(&'a ID3D12Resource, u64),
+    /// In a title buffer's host copy at an offset, whose state the host
+    /// does not name (buffers are promoted from COMMON on use).
+    Title(&'a ID3D12Resource, u64),
+}
+
+/// The work `records` of `kind` ask for, in `words` (`stride` bytes
+/// apart): how many ask for some, and how much in all. Draws: vertices
+/// (or indices) times instances; dispatches and mesh dispatches: groups.
+fn records_with_work(words: &[u32], kind: u32, stride: u32, records: usize) -> (usize, u64) {
+    let step = (stride as usize / 4).max(1);
+    let work = |r: usize| -> u64 {
+        let w = words.get(r * step..(r * step + step.min(3)).min(words.len())).unwrap_or(&[]);
+        match kind {
+            0 | 1 => u64::from(w.first().copied().unwrap_or(0)) * u64::from(w.get(1).copied().unwrap_or(1)),
+            _ => w.iter().take(3).map(|&x| u64::from(x)).product::<u64>() * u64::from(!w.is_empty()),
+        }
+    };
+    let busy = (0..records).filter(|&r| work(r) > 0).count();
+    (busy, (0..records).map(work).sum())
+}
+
+/// In a listed frame: copies an indirect execution's records and its count
+/// (a title buffer's copy and offset) to read-back memory, logged once the
+/// list has run, as our line logs it: "indirect kind K max M count C: B of
+/// R records with work, W in all; first [...] <pipeline>". An execution
+/// whose records ask for nothing draws nothing, which a dropped one does
+/// for another reason; the line tells the two apart.
+pub(crate) fn read_indirect(
+    list: &crate::host::HostList,
+    records: Records<'_>,
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, max): (u32, u32, u32),
+    name: String,
+) {
+    struct Readback(ID3D12Resource);
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Readback {}
+    let Some(host) = crate::host::host() else { return };
+    let len = u64::from(stride) * u64::from(max.max(1));
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len + 4,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let mut buffer: Option<ID3D12Resource> = None;
+    let l = &list.list;
+    // SAFETY: plain creation; an open list. The clamp's scratch buffer goes
+    // from the indirect-argument state to copy source and back; a title
+    // buffer's copy is promoted to copy source by the copy itself.
+    unsafe {
+        if host
+            .device
+            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+            .is_err()
+        {
+            return;
+        }
+        let Some(buffer) = buffer else { return };
+        match records {
+            Records::Clamped(scratch, at) => {
+                let (args, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                l.ResourceBarrier(&[crate::host::transition(scratch, args, copy)]);
+                l.CopyBufferRegion(&buffer, 0, scratch, at, len);
+                l.ResourceBarrier(&[crate::host::transition(scratch, copy, args)]);
+            }
+            Records::Title(copy, at) => l.CopyBufferRegion(&buffer, 0, copy, at, len),
+        }
+        if let Some((c, at)) = count {
+            l.CopyBufferRegion(&buffer, len, c, at, 4);
+        }
+        list.keep(&buffer);
+        let buffer = Readback(buffer);
+        let counted = count.is_some();
+        list.defer_after(move || {
+            let mut data = std::ptr::null_mut();
+            if buffer.0.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
+            let words = std::slice::from_raw_parts(data.cast::<u32>(), (len as usize + 4) / 4);
+            let n = counted.then(|| words[len as usize / 4]);
+            let records = n.unwrap_or(max).min(max) as usize;
+            let (busy, total) = records_with_work(words, kind, stride, records);
+            let step = (stride as usize / 4).max(1);
+            let shown: Vec<&[u32]> = (0..records.min(4)).map(|r| &words[r * step..r * step + step.min(4)]).collect();
+            tracing::info!(
+                target: "victory_gpu::trace",
+                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name}"
+            );
+            buffer.0.Unmap(0, None);
+        });
+    }
+}
+
+/// `VICTORY_DUMP_AFTER=<hash>[,<hash>]`: in the frames [`listed`], with a
+/// capture folder, the textures a draw or dispatch of a pipeline with one
+/// of these shaders renders to or writes are saved straight after it, as
+/// the GPU leaves them there (the copies are in the same list, behind the
+/// draw): `frame-<n>-after-<hash>-<k>-<i>-<resource>-<w>x<h>-f<format>.png`,
+/// the `k`th such draw of the frame, its `i`th texture. What
+/// `VICTORY_DUMP_TARGETS` saves is each texture at the frame's end, after
+/// every pass that writes it.
+fn dump_after_hashes() -> &'static [String] {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
+        let list = std::env::var("VICTORY_DUMP_AFTER").unwrap_or_default();
+        list.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
+    })
+}
+
+/// The textures the unordered access views of the draw or dispatch being
+/// bound write, by host list: what [`dump_after`] saves besides render
+/// targets.
+static WRITTEN: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// A draw or dispatch being bound on `list` writes `resource` through an
+/// unordered access view.
+pub(crate) fn note_written(list: usize, resource: crate::object::This) {
+    if !dump_after_hashes().is_empty() && recording_listed() {
+        WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).push((list, resource as usize));
+    }
+}
+
+/// The hash of `hashes` that `shaders` (a pipeline's, as
+/// `crate::pipeline::shaders_of` gives them) has, if any.
+fn named_after<'a>(hashes: &'a [String], shaders: &str) -> Option<&'a String> {
+    let shaders = shaders.to_ascii_lowercase();
+    hashes.iter().find(|h| shaders.contains(h.as_str()))
+}
+
+/// Which draw of `hash`'s pipeline this is in `frame`, from 0: `seen`
+/// holds this frame's counts (and forgets those of earlier frames).
+fn nth_after(seen: &mut Vec<(u64, String, u32)>, frame: u64, hash: &str) -> u32 {
+    seen.retain(|s| s.0 == frame);
+    match seen.iter_mut().find(|s| s.1 == hash) {
+        Some(s) => {
+            s.2 += 1;
+            s.2
+        }
+        None => {
+            seen.push((frame, hash.to_owned(), 0));
+            0
+        }
+    }
+}
+
+/// Straight after a draw or dispatch of `pipeline` on `list` (see
+/// [`dump_after_hashes`]): `targets` (render targets and depth) and the
+/// textures it writes through unordered access are copied out in the list
+/// and saved once the list has run.
+pub(crate) fn dump_after(list: &crate::host::HostList, pipeline: crate::object::This, targets: &[usize]) {
+    let hashes = dump_after_hashes();
+    if hashes.is_empty() {
+        return;
+    }
+    let key = std::ptr::from_ref(list) as usize;
+    let mut textures: Vec<usize> = targets.iter().copied().filter(|&t| t != 0).collect();
+    WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(l, r)| {
+        if l == key && !textures.contains(&r) {
+            textures.push(r);
+        }
+        l != key
+    });
+    if !recording_listed() {
+        return;
+    }
+    let Some(hash) = named_after(hashes, &crate::pipeline::shaders_of(pipeline)) else {
+        return;
+    };
+    let frame = crate::queue::presented() + 1;
+    static SEEN: std::sync::Mutex<Vec<(u64, String, u32)>> = std::sync::Mutex::new(Vec::new());
+    let k = nth_after(&mut SEEN.lock().unwrap_or_else(|e| e.into_inner()), frame, hash);
+    let Some(host) = crate::host::host() else { return };
+    for (i, &resource) in textures.iter().enumerate() {
+        let Some(copy) = crate::resource::host_copy(resource as crate::object::This) else { continue };
+        // SAFETY: a live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            continue;
+        }
+        // In the list's own account of the texture's state: the next draw
+        // that uses it moves it back.
+        crate::list::ensure_state(list, resource as crate::object::This, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let Some((buffer, footprint)) = read_back(&host.device, &list.list, &copy.texture) else { continue };
+        list.keep(&buffer);
+        struct Readback(ID3D12Resource);
+        // SAFETY: D3D12 objects are free-threaded.
+        unsafe impl Send for Readback {}
+        let buffer = Readback(buffer);
+        let name = format!("frame-{frame}-after-{hash}-{k}-{i:02}-{resource:#x}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
+        list.defer_after(move || {
+            let f = footprint.Footprint;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the list has run; the mapping spans the footprint's rows.
+            unsafe {
+                if buffer.0.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                    return;
+                }
+                let pitch = f.RowPitch as usize;
+                let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+                match to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+                    Some(rgba) => save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba),
+                    None => tracing::info!(format = f.Format.0, name, "texture after a draw not dumped: format"),
+                }
+                buffer.0.Unmap(0, None);
+            }
+        });
+    }
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
-    // (small pictures of menus, loading screens and title cards).
-    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    // Two frames in a row each time: the title draws to two buffers in turn,
+    // and every 8th or 16th frame alone only ever showed one of them.
+    // Before the world, with `VICTORY_CAPTURE_WORLD` and
+    // `VICTORY_CAPTURE_MENUS=1`: every 16th frame too (small pictures of
+    // menus, loading screens and title cards). Asked for apart: saving them
+    // makes the menus and their music stutter.
+    static MENUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let menus = *MENUS.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_MENUS").is_some_and(|v| v == "1"));
+    let before_world = menus && world_on() && n % 16 < 2 && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first) % 8 < 2;
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -184,11 +472,10 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    chunk(
-        &mut png,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
-    );
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
@@ -827,6 +1114,98 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_DUMP_AFTER` names pipelines by any of their shaders' hashes
+    /// (in either case), and numbers each one's draws from 0 in a frame.
+    #[test]
+    fn dump_after_names_a_pipeline_by_a_shader_and_counts_its_draws() {
+        let hashes = ["ce3f0432a08f1d35".to_owned(), "a1bf269d5b19f025".to_owned()];
+        let shaders = "[mesh F5E50EB2108C425B, pixel CE3F0432A08F1D35]";
+        assert_eq!(super::named_after(&hashes, shaders).map(String::as_str), Some("ce3f0432a08f1d35"));
+        assert_eq!(super::named_after(&hashes, "[compute 02384a60fda6f2d0]"), None);
+        assert_eq!(super::named_after(&hashes, "no pipeline"), None);
+        let mut seen = Vec::new();
+        assert_eq!(super::nth_after(&mut seen, 7, "a"), 0);
+        assert_eq!(super::nth_after(&mut seen, 7, "b"), 0);
+        assert_eq!(super::nth_after(&mut seen, 7, "a"), 1);
+        assert_eq!(super::nth_after(&mut seen, 8, "a"), 0, "a new frame counts afresh");
+        assert_eq!(seen.len(), 1);
+    }
+
+    /// The records an indirect execution logs as having work: a draw's
+    /// vertices times instances, a dispatch's or mesh dispatch's groups,
+    /// only as many records as the count allows.
+    #[test]
+    fn records_with_work_count_what_each_kind_asks_for() {
+        // Draws (vertices, instances, first vertex, first instance), 16 bytes.
+        let draws = [3, 2, 0, 0, 0, 5, 0, 0, 4, 1, 0, 0];
+        assert_eq!(super::records_with_work(&draws, 0, 16, 3), (2, 10), "6 and 4, and one of no vertices");
+        assert_eq!(super::records_with_work(&draws, 0, 16, 1), (1, 6), "a count of one");
+        // Mesh dispatches (x, y, z), 12 bytes: an empty one and two of work.
+        let meshes = [2, 1, 1, 0, 1, 1, 8, 2, 1];
+        assert_eq!(super::records_with_work(&meshes, 10, 12, 3), (2, 18));
+        assert_eq!(super::records_with_work(&meshes, 10, 12, 0), (0, 0), "a count of zero");
+    }
+
+    /// The reader records its copies into a real list, which runs, and its
+    /// line is made once the list has run (a title buffer's copy, as for a
+    /// dropped execution: no barrier of ours on it).
+    #[test]
+    fn read_indirect_copies_records_and_count_into_a_list_that_runs() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (buffer, data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: inside the mapping: two mesh records and a count.
+        unsafe { (data as *mut [u32; 7]).write([2, 1, 1, 0, 1, 1, 1]) };
+        let list = host.new_list().unwrap();
+        super::read_indirect(&list, super::Records::Title(&buffer, 0), Some((&buffer, 24)), (10, 12, 2), "test".to_owned());
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A title draw or mesh dispatch counts for the heavy scene's detector
+    /// whether it runs or is dropped, and a compute dispatch never: here
+    /// all are dropped (no pipeline). Before, the detector took draws run
+    /// plus drops, so a dropped compute dispatch counted and a run one did
+    /// not (Sol's review).
+    #[test]
+    fn draw_attempts_count_title_draws_run_or_not_and_no_dispatches() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        let before = crate::draw::attempted();
+        state.draw(&list, 3, 1, 0, 0);
+        state.draw_indexed(&list, 3, 1, 0, 0, 0);
+        state.dispatch_mesh(&list, 1);
+        assert_eq!(crate::draw::attempted() - before, 3, "a draw, an indexed draw and a mesh dispatch, all dropped");
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(crate::draw::attempted() - before, 3, "a compute dispatch, dropped, is not one");
+        list.close();
+    }
+
+    /// `VICTORY_CAPTURE_HEAVY_FRAMES` counts presented frames from the first
+    /// frame that recorded 1,000 title draws and mesh dispatches, run or
+    /// dropped. A light frame later does not move that start.
+    #[test]
+    fn heavy_frames_count_from_the_first_heavy_one() {
+        let offsets = [2, 5];
+        let mut state = super::Heavy::default();
+        assert!(!super::heavy_frame(10, 999, &mut state, &offsets), "999 attempts: not heavy");
+        assert_eq!(state.first, None);
+        // 1,000: the scene starts here; the list counts from the frame after.
+        assert!(!super::heavy_frame(11, 1_000, &mut state, &offsets));
+        assert_eq!(state.first, Some(11));
+        for (n, listed) in [(12, false), (13, true), (14, false), (15, false), (16, true), (17, false)] {
+            assert_eq!(super::heavy_frame(n, 0, &mut state, &offsets), listed, "{n}");
+        }
+        assert!(!super::heavy_frame(40, 10, &mut state, &offsets), "a later light frame");
+        assert_eq!(state.first, Some(11));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

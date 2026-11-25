@@ -85,6 +85,17 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Translate the shaders of a title's archives into the cache and make
+    /// their compute pipelines, so that a run finds them there.
+    Warm {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Only translate: no host pipelines.
+        #[arg(long)]
+        no_pipelines: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -163,6 +174,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
         Command::Run {
             exe,
             unimplemented,
@@ -170,7 +182,15 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let result = run::run(&exe, unimplemented, strict, execute, console);
+            // The process's own end, as `main`'s Result maps it: Ok is 0,
+            // Err is 1. A title that ends the process itself logs its own
+            // line and never returns here.
+            let code = if result.is_ok() { 0 } else { 1 };
+            tracing::info!("runtime exit: code {code}");
+            result
+        }
         Command::Config => show_config(),
     }
 }
