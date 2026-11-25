@@ -5898,6 +5898,14 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // In user mode, with a handler for the page that is not there
+    // (`crate::fastcopy`): no system call, and the processor's own pace.
+    if crate::fastcopy::on() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes
+        // (or guarded title memory, which its handler opens); a source page
+        // that is not there is the routine's failure.
+        return unsafe { crate::fastcopy::copy(dst, src, len) };
+    }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.

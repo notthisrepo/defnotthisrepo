@@ -25,6 +25,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod fastcopy;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
