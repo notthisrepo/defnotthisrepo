@@ -37,7 +37,8 @@ cbuffer Record : register(b0) {
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
     // run is left empty and costs nothing. Bit 2: one dispatch, written as
-    // SPLIT records of at most 65,535 groups in x each.
+    // SPLIT records of at most 65,535 groups in x each. Bit 3: nothing is
+    // clamped, the list's budget starts anew.
     uint has_count;
     uint count_offset;
 };
@@ -54,6 +55,12 @@ static const uint SPLIT = 2;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
+    if ((has_count & 8u) != 0) {
+        if (id.x == 0) {
+            budget.Store3(0, uint3(0, 0, 0));
+        }
+        return;
+    }
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     bool split = (has_count & 4u) != 0;
@@ -317,6 +324,36 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
 /// Bits of the clamp's `has_count`.
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
+const RESET: u32 = 8;
+
+/// In the prelude `l` of a list whose budget word is in the card's memory
+/// (`crate::host::budget_on_card`), at `budget`: the budget starts anew,
+/// before the clamps of the prelude and of the list charge it. A pass of
+/// one group and a wait for it; the views the pass does not read are given
+/// two words of our own.
+pub(crate) fn record_budget_reset(l: &ID3D12GraphicsCommandList, budget: u64) {
+    static SPARE: std::sync::OnceLock<Option<[ID3D12Resource; 2]>> = std::sync::OnceLock::new();
+    let (Some(c), Some([read, written])) = (clamp(), SPARE.get_or_init(|| {
+        let h = host()?;
+        Some([h.uav_buffer(256)?, h.uav_buffer(256)?])
+    })) else {
+        return;
+    };
+    let constants = [0u32, 4, 0, 0, RESET, 0];
+    // SAFETY: an open list; our root signature and pipeline; live buffers
+    // of at least the words the pass names.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, read.GetGPUVirtualAddress());
+        l.SetComputeRootShaderResourceView(2, read.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(3, written.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+}
 
 fn record_clamp(
     c: &Clamp,

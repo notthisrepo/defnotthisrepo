@@ -970,6 +970,27 @@ fn lazy_prelude() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a list's budget for indirect work (`crate::indirect`: the word
+/// every clamp of an indirect record charges) is in the card's memory
+/// (`VICTORY_BUDGET_SHARED=1`: in the PC's memory shared with the card, as
+/// before).
+///
+/// It was a buffer the CPU zeroes at each submission, so in the PC's
+/// memory: each clamp's interlocked charge (and, for a mesh record, two
+/// more interlocked words of diagnostics) went over the bus, 3,700 passes
+/// a frame in the world. Timed by list (`crate::clock`, 7,800 draws a
+/// frame): the preludes, which do little else than 2,600 such passes, took
+/// 45 ms of the card's 170 a frame, 17 microseconds a pass.
+///
+/// On the card the word is started anew by a pass in the list's prelude
+/// (`crate::indirect::record_budget_reset`), which a list that charges it
+/// then always has. The mesh dispatches' counts on the frame line
+/// ("the largest group count asked for") are not read back then: zero.
+pub(crate) fn budget_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUDGET_SHARED").is_none_or(|v| v != "1"))
+}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -5232,8 +5253,14 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
+        // The budget word in the card's memory, if the list charges it.
+        let budget = (budget_on_card() && self.deferred().budget_zeroed)
+            .then(|| self.budget.get().and_then(|b| b.as_ref()))
+            .flatten()
+            // SAFETY: a live buffer.
+            .map(|(buffer, _)| unsafe { buffer.GetGPUVirtualAddress() });
         let ahead = self.ahead();
-        if barriers.is_empty() && syncs.is_empty() && ahead.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && ahead.is_empty() && budget.is_none() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5258,6 +5285,9 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if let Some(budget) = budget {
+                    crate::indirect::record_budget_reset(list, budget);
                 }
                 // The list's indirect records, clamped before it starts.
                 crate::indirect::record_ahead(list, &ahead);
@@ -5488,6 +5518,20 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        if budget_on_card() {
+            let (buffer, _) = self
+                .budget
+                .get_or_init(|| {
+                    let b = host()?.uav_buffer(256)?;
+                    name(&b, || "a list's budget for indirect work".into());
+                    Some((b, 0))
+                })
+                .as_ref()?;
+            // The list's prelude starts it anew on the card.
+            self.deferred().budget_zeroed = true;
+            // SAFETY: a live buffer.
+            return Some(unsafe { buffer.GetGPUVirtualAddress() });
+        }
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
