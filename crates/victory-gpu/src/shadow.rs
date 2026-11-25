@@ -187,7 +187,17 @@ fn card_defaults(budget: Option<u64>) -> (u64, u64) {
 
 #[cfg(test)]
 mod card_default_tests {
-    use super::card_defaults;
+    use super::{card_defaults, window_card_default};
+
+    /// Windows go to the card only where it has 12 GiB or more to give.
+    #[test]
+    fn windows_go_to_the_card_only_on_a_big_card() {
+        assert_eq!(window_card_default(None), 0);
+        assert_eq!(window_card_default(Some(8 << 30)), 0);
+        assert_eq!(window_card_default(Some((12 << 30) - 1)), 0);
+        assert_eq!(window_card_default(Some(12 << 30)), 4096);
+        assert_eq!(window_card_default(Some(15_277 << 20)), 4096);
+    }
 
     /// A card under 12 GiB, or one whose budget is not known, takes buffers
     /// from 1 MiB up to 1,024 MiB in all; a big card takes an eighth of its
@@ -275,7 +285,20 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`; 0: none; by default what
+/// [`window_card_default`] gives for the card's budget).
+///
+/// What reading over the bus costs, measured on an RTX 4080 SUPER with no
+/// title (`tests/read_cost.rs`): a compute pass that reads 64 KiB takes
+/// 0.4 microseconds from the card's memory and 13 from the PC's, as shared
+/// buffers are made; the bus gives about 4.5 GB a second where the card's
+/// own memory gives 55 to 200. In the title, with 4,096 here (1.5 GB of
+/// 3.8 GB of windows found room): the loading scene of one save went from
+/// 2.7-3.0 to 3.1-3.5 fps (196-231 to 166-179 ms a frame on the card), the
+/// first room from 3.4-4.1 to 5.2-5.9 fps. With 6,000 and textures held to
+/// 60 % of the budget (3.2 GB of windows on the card) nothing more was
+/// gained and 18,000 textures waited: the default leaves textures their
+/// room.
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -295,8 +318,20 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let asked = std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let budget = host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        asked.unwrap_or_else(|| window_card_default(budget)) << 20
     })
+}
+
+/// [`window_card_most`]'s default in MiB for a card whose memory budget is
+/// `budget` bytes (`None`: not known): 4,096 from 12 GiB on, none below,
+/// where the textures need what the card has.
+fn window_card_default(budget: Option<u64>) -> u64 {
+    match budget {
+        Some(budget) if budget >= 12 << 30 => 4096,
+        _ => 0,
+    }
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
