@@ -937,6 +937,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// The indirect records the list's prelude clamps ahead of it
+    /// (`crate::indirect::ahead`).
+    ahead: Mutex<crate::indirect::Ahead>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3251,6 +3254,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                ahead: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4874,6 +4878,7 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        crate::indirect::ahead_done(&self.list, &self.ahead());
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -4892,6 +4897,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.ahead().reset();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -5200,7 +5206,8 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let ahead = self.ahead();
+        if barriers.is_empty() && syncs.is_empty() && ahead.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5224,6 +5231,8 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                // The list's indirect records, clamped before it starts.
+                crate::indirect::record_ahead(list, &ahead);
                 list.Close()
             })
         };
@@ -5503,6 +5512,11 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// The list's records clamped ahead of it (`crate::indirect::ahead`).
+    pub(crate) fn ahead(&self) -> std::sync::MutexGuard<'_, crate::indirect::Ahead> {
+        self.ahead.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -6282,6 +6296,7 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        crate::indirect::ahead_line(frames);
         late_line(frames);
         let [card_idle, stood] = card_clock_line(frames, ms);
         if crate::overlay::enabled() {

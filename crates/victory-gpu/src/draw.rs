@@ -134,10 +134,21 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// The storing commands the list had when the window was clamped
+    /// (`crate::indirect::Ahead::storing`): one more, and its records
+    /// may have been written anew.
+    storing: u64,
 }
 
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
+/// The most where a command of the list wrote the records and the window
+/// reaches to the end of what it wrote: no more than the others, taken at
+/// once at the second record instead of 16, then 32. With 2,048 the frame
+/// took 380 to 780 ms on the card where it took 190: a window served 27
+/// draws on average and clamped a thousand records for them, every
+/// thread of that pass waiting its turn at the list's one budget word.
+const WINDOW_WRITTEN_MOST: u64 = 64;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -179,9 +190,30 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+///
+/// Since records are clamped ahead of their list (`crate::indirect::aheads`)
+/// the switch is on with that one unless set to 0: it takes the records
+/// that cannot be clamped ahead, those a command of their own list
+/// writes (the title's culling passes write the mesh records their list
+/// then draws: 2,700 of 7,000 records a frame in the scene measured).
+/// For these the window ends at the list's next command whose shaders
+/// store to buffers, not at every dispatch and direct draw, and once the
+/// step is known it reaches to the end of the range that command was
+/// given to write ([`WINDOW_WRITTEN_MOST`] records at most).
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_WINDOW").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => crate::indirect::aheads(),
+    })
+}
+
+/// Whether a window ends at every dispatch and direct draw, as it did
+/// before the list counted its storing commands: without records clamped
+/// ahead.
+fn window_ends_at_any() -> bool {
+    !crate::indirect::aheads()
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -1008,6 +1040,11 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            if t.stores {
+                // It may write argument memory: a window of records
+                // clamped before it ends here.
+                list.ahead().stored();
+            }
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
@@ -1997,7 +2034,9 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        if window_ends_at_any() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2329,7 +2368,9 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        self.window = None;
+        if window_ends_at_any() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2725,7 +2766,9 @@ impl State {
         first_instance: u32,
     ) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        self.window = None;
+        if window_ends_at_any() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2833,7 +2876,9 @@ impl State {
         first_instance: u32,
     ) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        self.window = None;
+        if window_ends_at_any() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3021,14 +3066,42 @@ impl State {
         } else {
             None
         };
-        let windowed = windows()
-            && kind != DISPATCH
+        let single = kind != DISPATCH
             && max == 1
             && count.is_none()
             && !p.stages.iter().any(|stage| stage.translated().stores);
+        // Clamped ahead of the list, by its prelude (`crate::indirect::aheads`):
+        // the draw reads its record at a place of the list's own, and no
+        // pass of ours stands between it and the draw before.
+        if !single {
+            let why = if kind == DISPATCH {
+                5
+            } else if max != 1 {
+                6
+            } else if count.is_some() {
+                7
+            } else {
+                8
+            };
+            crate::indirect::AHEAD_COUNTS[why].fetch_add(1, Ordering::Relaxed);
+        }
+        let placed = if single {
+            crate::indirect::ahead(list, &args.buffer, (args.id(), offset, args.left(arguments)), (kind, stride), arguments)
+        } else {
+            None
+        };
+        let ahead = placed.is_some();
+        if ahead {
+            args.refresh(list, arguments, len);
+        }
+        let windowed = windows() && single && !ahead;
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
+        let (storing, written_end) = {
+            let a = list.ahead();
+            (a.storing(), a.written_end(arguments))
+        };
+        if !windowed || list.first_use(WINDOW_USE) || self.window.as_ref().is_some_and(|w| w.storing != storing) {
             self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
@@ -3038,7 +3111,7 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match hit {
+        let (bounded, at) = match placed.or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -3054,8 +3127,14 @@ impl State {
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            // Where a command of the list wrote the
+                            // records, to the end of what it wrote.
+                            let (most, wanted) = match written_end {
+                                Some(end) => (WINDOW_WRITTEN_MOST, (end.saturating_sub(arguments) / step) as u32),
+                                None => (WINDOW_MOST, if w.records == 1 { 16 } else { w.records * 2 }),
+                            };
+                            let fit = (args.left(arguments) / step).min(most) as u32;
+                            (step as u32, wanted.min(fit).max(1))
                         } else {
                             (stride, max)
                         }
@@ -3094,6 +3173,7 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    storing,
                 });
                 (bounded, 0)
             }
@@ -3105,7 +3185,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !ahead {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3153,7 +3235,10 @@ impl State {
             let name = crate::pipeline::shaders_of(self.pipeline as This);
             crate::capture::read_indirect(list, crate::capture::Records::Clamped(&bounded, at), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &bounded);
+        // A place clamped ahead stays as it is until the list's end.
+        if !ahead {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

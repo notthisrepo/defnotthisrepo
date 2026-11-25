@@ -464,6 +464,499 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     }
 }
 
+/// Whether indirect records are clamped ahead of their list ([`ahead`]):
+/// on by default, `VICTORY_INDIRECT_AHEAD=0` clamps each where it is drawn.
+///
+/// The title issues its draws one record a call (6,000 to 8,000 a frame in
+/// the world), and before each our clamp ran as a compute dispatch of its
+/// own between two waits for every earlier shader write: the card left the
+/// title's draws for a pass of ours and came back, once per record. Timed
+/// on the card with the same scene (7,800 draws a frame, RTX 4080 SUPER),
+/// taking 2,900 of 7,050 such passes away saved about 35 ms of 240 a frame:
+/// some 12 microseconds a pass.
+///
+/// With it, a record's clamp is not recorded where the record is drawn.
+/// The list notes the record and gives it a place in a scratch buffer of
+/// its own; records that follow each other in one argument buffer make one
+/// run ([`Plan`]). When the list is submitted, the list that runs just
+/// before it (its prelude, which already moves its textures to the states
+/// it starts with) clamps every run, one dispatch each with no wait between
+/// them, and the draws read their record at its place.
+///
+/// What makes that the same as clamping at the draw: nothing between the
+/// start of the list and the draw may write the record. Other lists run
+/// wholly before or after this one, and what the title's CPU side wrote is
+/// taken at submission either way. So the only writer to exclude is a
+/// command of the same list recorded before the draw. A shader writes
+/// buffers only in the ranges declared for it (`Shadow::gpu_writes`, what
+/// copying back rests on), and the list notes each ([`Ahead::wrote`]): a
+/// record inside one, by its address in title memory, is clamped where
+/// it is drawn, as before. Records with a count buffer, of more than one
+/// record, and dispatches are left as they were too.
+///
+/// The budget (`BUDGET` in the clamp) is charged for exactly the records
+/// the list draws, as before, but for all of them before the list starts:
+/// in a list that runs out of it, which records run empty may differ.
+pub(crate) fn aheads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_AHEAD").is_none_or(|v| v != "0"))
+}
+
+/// The bytes of one scratch buffer for records clamped ahead, and the most
+/// of them a list takes: records past that are clamped where they are
+/// drawn.
+const CHUNK: u64 = 64 << 10;
+const CHUNKS_MOST: usize = 16;
+/// The widest step between two records of one run (as `crate::draw`'s
+/// windows take it).
+const STEP_MOST: u64 = 256;
+/// The most written ranges a list keeps apart ([`Ahead::wrote`]); with
+/// more, its later records are all clamped where they are drawn.
+const WRITTEN_MOST: usize = 256;
+
+/// Since the last frame-rate line: records given a place, records that
+/// found the place an earlier draw of the list had made, runs clamped in
+/// preludes, and records left to the clamp at their draw because a
+/// command of the list before them may have written them or the list had
+/// no room left.
+///
+/// Then the records that are not single ones, by why: a dispatch, more
+/// than one record, a count buffer, a pipeline whose shaders store.
+pub(crate) static AHEAD_COUNTS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// Records of one argument buffer a fixed step apart, clamped in one
+/// dispatch: `records` of them from offset `base` of copy `copy`, record
+/// `i` going to `at + i * step` of scratch buffer `chunk`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Run {
+    copy: u64,
+    kind: u32,
+    stride: u32,
+    step: u32,
+    base: u64,
+    records: u32,
+    chunk: usize,
+    at: u64,
+}
+
+/// Where a list's records clamped ahead go: no host objects, so that it
+/// can be tested alone.
+#[derive(Debug, Default)]
+struct Plan {
+    runs: Vec<Run>,
+    /// Bytes taken of each scratch buffer.
+    used: Vec<u64>,
+    /// A record already placed: (copy, kind, stride, offset) to (scratch
+    /// buffer, offset in it).
+    places: std::collections::HashMap<(u64, u32, u32, u64), (usize, u64)>,
+}
+
+impl Plan {
+    /// The place of the record of `kind` and `stride` at `offset` of copy
+    /// `copy`, of which `left` bytes are left from there: (scratch buffer,
+    /// offset in it, whether a run was added, whether the place was there
+    /// already). `None`: no room.
+    ///
+    /// A record one step after the last run's last one joins that run
+    /// (the step is what the title walks the buffer by, [`STEP_MOST`] at
+    /// most; the clamp copies a whole step per record, so each record has
+    /// a step of the scratch buffer to itself and its step must be inside
+    /// the argument buffer). Any other record starts a run.
+    fn place(&mut self, (copy, kind, stride): (u64, u32, u32), offset: u64, left: u64) -> Option<(usize, u64, bool, bool)> {
+        let key = (copy, kind, stride, offset);
+        if let Some(&(chunk, at)) = self.places.get(&key) {
+            return Some((chunk, at, false, true));
+        }
+        let wide = u64::from(stride);
+        if left < wide {
+            return None;
+        }
+        if let Some(run) = self.runs.last_mut()
+            && (run.copy, run.kind, run.stride) == (copy, kind, stride)
+        {
+            let step = if run.records == 1 { offset.checked_sub(run.base) } else { Some(u64::from(run.step)) };
+            if let Some(step) = step
+                && (wide..=STEP_MOST).contains(&step)
+                && step.is_multiple_of(4)
+                && offset == run.base + u64::from(run.records) * step
+                && left >= step
+                // The run is the last thing in its buffer, and one more
+                // step fits behind it.
+                && self.used[run.chunk] == run.at + u64::from(run.records) * u64::from(run.step)
+                && run.at + (u64::from(run.records) + 1) * step <= CHUNK
+            {
+                let at = run.at + u64::from(run.records) * step;
+                run.step = step as u32;
+                run.records += 1;
+                self.used[run.chunk] = at + step;
+                self.places.insert(key, (run.chunk, at));
+                return Some((run.chunk, at, false, false));
+            }
+        }
+        let chunk = match self.used.last() {
+            Some(&used) if used + wide <= CHUNK => self.used.len() - 1,
+            _ if self.used.len() < CHUNKS_MOST => {
+                self.used.push(0);
+                self.used.len() - 1
+            }
+            _ => return None,
+        };
+        let at = self.used[chunk];
+        self.used[chunk] = at + wide;
+        self.runs.push(Run { copy, kind, stride, step: stride, base: offset, records: 1, chunk, at });
+        self.places.insert(key, (chunk, at));
+        Some((chunk, at, true, false))
+    }
+
+    fn clear(&mut self) {
+        self.runs.clear();
+        self.used.clear();
+        self.places.clear();
+    }
+}
+
+/// A host list's records clamped ahead of it ([`aheads`]).
+#[derive(Default)]
+pub(crate) struct Ahead {
+    /// Every later record is clamped where it is drawn: too many ranges
+    /// written to keep, or no scratch buffer.
+    tainted: bool,
+    /// The ranges of title memory (start, end) that commands of the list
+    /// so far may have written: a record in one is clamped where it is
+    /// drawn.
+    written: Vec<(u64, u64)>,
+    /// Commands of the list so far whose shaders store to buffers: what a
+    /// window of records clamped in the list was clamped before
+    /// (`crate::draw`'s windows).
+    storing: u64,
+    plan: Plan,
+    /// The argument buffer of each of the plan's runs.
+    sources: Vec<ID3D12Resource>,
+    /// The scratch buffers the plan's places are in, and those of earlier
+    /// recordings of the list, kept for the next.
+    chunks: Vec<ID3D12Resource>,
+    /// The list's budget word, as the clamp is given it.
+    budget: u64,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the rest is plain data.
+unsafe impl Send for Ahead {}
+
+impl Ahead {
+    /// A command recorded in the list may write `len` bytes of title
+    /// memory at `address` through a host copy.
+    pub(crate) fn wrote(&mut self, address: u64, len: u64) {
+        let range = (address, address.saturating_add(len));
+        if self.tainted || len == 0 || self.written.iter().any(|w| w.0 <= range.0 && range.1 <= w.1) {
+            return;
+        }
+        self.written.retain(|w| !(range.0 <= w.0 && w.1 <= range.1));
+        self.written.push(range);
+        if self.written.len() > WRITTEN_MOST {
+            self.tainted = true;
+            self.written.clear();
+        }
+    }
+
+    /// A command whose shaders store to buffers is recorded in the list:
+    /// records clamped in the list before it may be written anew.
+    pub(crate) fn stored(&mut self) {
+        self.storing += 1;
+    }
+
+    /// How many storing commands the list has so far ([`Ahead::stored`]).
+    pub(crate) fn storing(&self) -> u64 {
+        self.storing
+    }
+
+    /// The end of the written range that holds `address`, the farthest
+    /// if several do.
+    pub(crate) fn written_end(&self, address: u64) -> Option<u64> {
+        self.written.iter().filter(|w| w.0 <= address && address < w.1).map(|w| w.1).max()
+    }
+
+    /// Whether a command of the list so far may have written title
+    /// memory in `len` bytes at `address`.
+    fn may_have_written(&self, address: u64, len: u64) -> bool {
+        self.tainted || self.written.iter().any(|w| w.0 < address.saturating_add(len) && address < w.1)
+    }
+
+    /// The list is reset: nothing is placed, the scratch buffers stay.
+    pub(crate) fn reset(&mut self) {
+        self.tainted = false;
+        self.storing = 0;
+        self.written.clear();
+        self.plan.clear();
+        self.sources.clear();
+    }
+
+    /// Whether the list's prelude has no runs to clamp.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.plan.runs.is_empty()
+    }
+}
+
+/// The place where a draw of `list` reads the record of `kind` and `stride`
+/// at `offset` of the argument buffer `src` (host copy `copy`, `left` bytes
+/// left from the record; `address` is the record's in title memory): a
+/// scratch buffer of the list and the offset in
+/// it, in `INDIRECT_ARGUMENT` from the list's start to its end. The list's
+/// prelude clamps the record there ([`record_ahead`]). `None`: the record
+/// is clamped where it is drawn ([`bound`]): the switch is off, a command
+/// before it in the list may have written it, or there is no room or no
+/// clamp.
+pub(crate) fn ahead(
+    list: &HostList,
+    src: &ID3D12Resource,
+    (copy, offset, left): (u64, u64, u64),
+    (kind, stride): (u32, u32),
+    address: u64,
+) -> Option<(ID3D12Resource, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !aheads() {
+        return None;
+    }
+    validate_layout((kind, stride, 1), offset, None)?;
+    clamp()?;
+    // SAFETY: a live buffer.
+    if !unsafe { src.GetGPUVirtualAddress() }.is_multiple_of(4) {
+        return None;
+    }
+    // Before the list's own lock: the budget takes the list's deferred work.
+    let budget = list.budget()?;
+    let mut a = list.ahead();
+    if a.may_have_written(address, u64::from(stride)) {
+        // The first of them, to see what the writers declare.
+        static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SHOWN.fetch_add(1, Relaxed) < 40 {
+            let hit = a.written.iter().find(|w| w.0 < address + u64::from(stride) && address < w.1);
+            tracing::info!(
+                record = format_args!("{address:#x}"),
+                kind,
+                range = ?hit.map(|w| format!("{:#x}+{:#x}", w.0, w.1 - w.0)),
+                ranges = a.written.len(),
+                all = a.tainted,
+                "an indirect record a command of its list may have written"
+            );
+        }
+        AHEAD_COUNTS[3].fetch_add(1, Relaxed);
+        return None;
+    }
+    let Some((chunk, at, added, found)) = a.plan.place((copy, kind, stride), offset, left) else {
+        AHEAD_COUNTS[4].fetch_add(1, Relaxed);
+        return None;
+    };
+    if added {
+        a.sources.push(src.clone());
+    }
+    while a.chunks.len() <= chunk {
+        let Some(buffer) = host().and_then(|h| h.uav_buffer(CHUNK)) else {
+            // Nothing reads the place: the record is clamped at its draw,
+            // and so is every later one of the list.
+            a.tainted = true;
+            a.plan.places.remove(&(copy, kind, stride, offset));
+            if added {
+                a.plan.runs.pop();
+                a.sources.pop();
+            } else if let Some(run) = a.plan.runs.last_mut() {
+                run.records -= 1;
+            }
+            return None;
+        };
+        crate::host::name(&buffer, || format!("indirect arguments clamped ahead {CHUNK:#x}"));
+        a.chunks.push(buffer);
+    }
+    a.budget = budget;
+    AHEAD_COUNTS[usize::from(found)].fetch_add(1, Relaxed);
+    Some((a.chunks[chunk].clone(), at))
+}
+
+/// In the prelude `l` of a list, at its submission: clamps every run of
+/// the list's records placed by [`ahead`], and leaves their scratch buffers
+/// in `INDIRECT_ARGUMENT` ([`ahead_done`] takes them back at the list's
+/// end). One wait for every earlier shader write before the runs and one
+/// after them; none between, the runs write places of their own and charge
+/// the budget with interlocked operations.
+pub(crate) fn record_ahead(l: &ID3D12GraphicsCommandList, a: &Ahead) {
+    let Some(c) = clamp() else { return };
+    if a.is_empty() {
+        return;
+    }
+    let used = a.plan.used.len().min(a.chunks.len());
+    let moves = |from, to| -> Vec<D3D12_RESOURCE_BARRIER> {
+        std::iter::once(uav_barrier()).chain(a.chunks[..used].iter().map(|b| transition(b, from, to))).collect()
+    };
+    // SAFETY: an open list; our root signature and pipeline; live argument
+    // buffers (the list keeps their copies until it is reset), scratch
+    // buffers of the list in COMMON and its budget word.
+    unsafe {
+        l.ResourceBarrier(&moves(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRootUnorderedAccessView(4, a.budget);
+        for (run, src) in a.plan.runs.iter().zip(&a.sources) {
+            let base = src.GetGPUVirtualAddress();
+            let bytes = u64::from(run.step) * u64::from(run.records);
+            // As `record_clamp_as`: an offset past 32 bits goes into the
+            // address.
+            let (src_gpu, args_offset) = match run.base.checked_add(bytes).filter(|&end| end <= u64::from(u32::MAX)) {
+                Some(_) => (base, run.base as u32),
+                None => (base + run.base, 0),
+            };
+            let constants = [run.kind, run.step, run.records, args_offset, 0, 0];
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, src_gpu);
+            l.SetComputeRootUnorderedAccessView(3, a.chunks[run.chunk].GetGPUVirtualAddress() + run.at);
+            l.Dispatch(run.records.div_ceil(64), 1, 1);
+        }
+        l.ResourceBarrier(&moves(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT));
+    }
+    AHEAD_COUNTS[2].fetch_add(a.plan.runs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// At the end of a list `l`, before it is closed: the scratch buffers of
+/// its records clamped ahead go back to `COMMON`, where its next prelude
+/// finds them.
+pub(crate) fn ahead_done(l: &ID3D12GraphicsCommandList, a: &Ahead) {
+    if a.is_empty() {
+        return;
+    }
+    let used = a.plan.used.len().min(a.chunks.len());
+    let back: Vec<D3D12_RESOURCE_BARRIER> = a.chunks[..used]
+        .iter()
+        .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
+        .collect();
+    // SAFETY: an open list and live scratch buffers in INDIRECT_ARGUMENT.
+    unsafe { l.ResourceBarrier(&back) };
+}
+
+/// For the frame-rate line: [`AHEAD_COUNTS`] per frame.
+pub(crate) fn ahead_line(frames: f64) {
+    let [placed, found, runs, tainted, full, dispatches, many, counted, storing] =
+        std::array::from_fn(|i| AHEAD_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if placed + found + tainted + full + dispatches + many + counted + storing > 0.0 {
+        tracing::info!(
+            "indirect records clamped ahead per frame: {placed:.0} in {runs:.0} runs, {found:.0} more found in place; \
+             left to the clamp at their draw: {tainted:.0} that a command of their list may have written, {full:.0} for lack of room \
+             (VICTORY_INDIRECT_AHEAD=0: all of them); not single records: {dispatches:.0} dispatches, {many:.0} of more than one record, \
+             {counted:.0} with a count buffer, {storing:.0} drawn by shaders that store"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::*;
+
+    /// Records a step apart in one buffer make one run; the step is the
+    /// one the second record shows, and each record has a step to itself.
+    #[test]
+    fn records_that_follow_each_other_make_one_run() {
+        let mut p = Plan::default();
+        let mesh = (7, 10, 12);
+        assert_eq!(p.place(mesh, 0x100, 4096), Some((0, 0, true, false)));
+        assert_eq!(p.place(mesh, 0x120, 4096), Some((0, 32, false, false)));
+        assert_eq!(p.place(mesh, 0x140, 4096), Some((0, 64, false, false)));
+        assert_eq!(p.runs.len(), 1);
+        assert_eq!((p.runs[0].step, p.runs[0].records, p.runs[0].base, p.runs[0].at), (32, 3, 0x100, 0));
+        assert_eq!(p.used, [96]);
+        // The same record again is found where it is.
+        assert_eq!(p.place(mesh, 0x120, 4096), Some((0, 32, false, true)));
+        assert_eq!(p.runs[0].records, 3);
+    }
+
+    /// Another step, another buffer, another kind, a record before the
+    /// run or one that is not next start a run of their own, behind what
+    /// is placed.
+    #[test]
+    fn a_record_that_does_not_follow_starts_a_run() {
+        let mut p = Plan::default();
+        let mesh = (7, 10, 12);
+        p.place(mesh, 0x100, 4096);
+        p.place(mesh, 0x120, 4096);
+        // Not the run's step.
+        assert_eq!(p.place(mesh, 0x130, 4096), Some((0, 64, true, false)));
+        // Before the last run.
+        assert_eq!(p.place(mesh, 0x80, 4096), Some((0, 76, true, false)));
+        // Another copy, another kind.
+        assert_eq!(p.place((8, 10, 12), 0x8c, 4096), Some((0, 88, true, false)));
+        assert_eq!(p.place((8, 0, 16), 0x98, 4096), Some((0, 100, true, false)));
+        assert_eq!(p.runs.len(), 5);
+        // The first run is no longer the last thing placed: its next
+        // record starts a run too.
+        assert_eq!(p.place(mesh, 0x140, 4096), Some((0, 116, true, false)));
+    }
+
+    /// A step wider than the widest, one that is not whole words, and one
+    /// that would read past the argument buffer do not join.
+    #[test]
+    fn steps_that_cannot_be_walked_do_not_join() {
+        let mesh = (7, 10, 12);
+        let mut p = Plan::default();
+        p.place(mesh, 0, 4096);
+        assert_eq!(p.place(mesh, 260, 4096), Some((0, 12, true, false)));
+        let mut p = Plan::default();
+        p.place(mesh, 0, 4096);
+        assert_eq!(p.place(mesh, 14, 4096), Some((0, 12, true, false)));
+        let mut p = Plan::default();
+        p.place(mesh, 0, 4096);
+        // 16 bytes left from the record, its step would be 32.
+        assert_eq!(p.place(mesh, 32, 16), Some((0, 12, true, false)));
+        // Less than a record left: no place.
+        assert_eq!(p.place(mesh, 64, 8), None);
+    }
+
+    /// A record is left to its draw only where a command of the list may
+    /// have written it; ranges inside others are not kept twice.
+    #[test]
+    fn only_records_in_written_ranges_are_left_to_their_draw() {
+        let mut a = Ahead::default();
+        assert!(!a.may_have_written(0x1000, 12));
+        a.wrote(0x2000, 0x100);
+        a.wrote(0x2010, 0x10);
+        assert_eq!(a.written, [(0x2000, 0x2100)]);
+        assert!(a.may_have_written(0x20f8, 12));
+        assert!(a.may_have_written(0x1ff8, 12));
+        assert!(!a.may_have_written(0x1ff4, 12));
+        assert!(!a.may_have_written(0x2100, 12));
+        // A wider range takes the place of those inside it.
+        a.wrote(0x1000, 0x2000);
+        assert_eq!(a.written, [(0x1000, 0x3000)]);
+        a.wrote(0x5000, 0);
+        assert_eq!(a.written.len(), 1);
+        assert_eq!(a.written_end(0x1800), Some(0x3000));
+        assert_eq!(a.written_end(0x3000), None);
+        a.stored();
+        assert_eq!(a.storing(), 1);
+        // Too many to keep apart: everything after is left to its draw.
+        for i in 0..=WRITTEN_MOST as u64 {
+            a.wrote(0x10_0000 + i * 0x100, 0x10);
+        }
+        assert!(a.may_have_written(0x9000_0000, 12));
+        a.reset();
+        assert!(!a.may_have_written(0x2000, 12));
+        assert_eq!(a.storing(), 0);
+    }
+
+    /// A full scratch buffer is followed by the next, and past the last
+    /// there is no room.
+    #[test]
+    fn buffers_fill_one_after_another() {
+        let mesh = (7, 10, 32);
+        let mut p = Plan::default();
+        let per_chunk = CHUNK / 32;
+        for i in 0..per_chunk {
+            assert_eq!(p.place(mesh, i * 32, 1 << 30), Some((0, i * 32, i == 0, false)));
+        }
+        // The run cannot grow past its buffer: the next record starts one
+        // in the next buffer.
+        assert_eq!(p.place(mesh, per_chunk * 32, 1 << 30), Some((1, 0, true, false)));
+        p.used = vec![CHUNK; CHUNKS_MOST];
+        assert_eq!(p.place(mesh, 1 << 20, 1 << 30), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
