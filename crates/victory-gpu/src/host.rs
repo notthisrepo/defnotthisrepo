@@ -950,6 +950,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_CARD_CLOCK`: the token of the timestamp at the
+    /// list's start (`crate::clock`), until it is closed.
+    #[cfg(feature = "diagnostics")]
+    clock: std::sync::atomic::AtomicU32,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3260,6 +3264,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                clock: std::sync::atomic::AtomicU32::new(0),
             })
         }
     }
@@ -3456,6 +3462,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let clock = crate::clock::begin(list, crate::clock::SEND);
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3501,6 +3509,8 @@ impl Host {
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::clock::end(list, clock);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -3562,6 +3572,8 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let clock = crate::clock::begin(list, crate::clock::COMPARE);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -3586,6 +3598,8 @@ impl Host {
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::clock::end(list, clock);
                     list.Close()?;
                     list.cast()
                 })()
@@ -3727,9 +3741,13 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                #[cfg(feature = "diagnostics")]
+                let clock = crate::clock::begin(&list, crate::clock::FETCH);
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::clock::end(&list, clock);
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
@@ -3966,9 +3984,13 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let clock = crate::clock::begin(list, crate::clock::FETCH);
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::clock::end(list, clock);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -4879,6 +4901,8 @@ impl HostList {
             }
         }
         crate::indirect::ahead_done(&self.list, &self.ahead());
+        #[cfg(feature = "diagnostics")]
+        crate::clock::end(&self.list, self.clock.swap(0, Ordering::Relaxed));
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -4918,6 +4942,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        #[cfg(feature = "diagnostics")]
+        self.clock.store(crate::clock::begin(&self.list, crate::clock::TITLE), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -5222,6 +5248,8 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                #[cfg(feature = "diagnostics")]
+                let clock = crate::clock::begin(list, crate::clock::PRELUDE);
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -5233,6 +5261,8 @@ impl HostList {
                 }
                 // The list's indirect records, clamped before it starts.
                 crate::indirect::record_ahead(list, &ahead);
+                #[cfg(feature = "diagnostics")]
+                crate::clock::end(list, clock);
                 list.Close()
             })
         };
@@ -6313,6 +6343,8 @@ impl Meter {
         );
         crate::indirect::ahead_line(frames);
         late_line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::clock::line(frames, ms);
         let [card_idle, stood] = card_clock_line(frames, ms);
         if crate::overlay::enabled() {
             use crate::draw::{HEAP_TEXTURE_BYTES, HEAP_TEXTURES, HEAP_TEXTURES_AWAY, HEAP_TEXTURES_FULL, HEAP_TEXTURES_WAITING};

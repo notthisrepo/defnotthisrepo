@@ -17,6 +17,8 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod clock;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
