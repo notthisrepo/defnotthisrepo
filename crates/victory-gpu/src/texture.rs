@@ -60,6 +60,10 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The texture's host copy if that is a sparse one (`crate::sparse`):
+    /// its levels get the card's memory when their title memory is read
+    /// here ([`Staging::map_sparse`]).
+    sparse: Option<std::sync::Weak<crate::resource::HostTexture>>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -233,6 +237,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !first && before.is_none() {
         return true;
     }
+    crate::resource::sparse_whole(placed);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
@@ -465,6 +470,7 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    crate::resource::sparse_whole(resource);
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
@@ -907,9 +913,30 @@ impl Staging {
         }
     }
 
+    /// With a sparse host copy: the levels whose title memory is there now
+    /// get the card's memory, before the list that copies them runs (this
+    /// is a submission's check, ahead of its lists on the queue). The
+    /// title's memory for a texture streaming in holds its smaller levels,
+    /// which lie first; a larger one that is not there was read as zeros,
+    /// and its copy into levels without memory is dropped by the host.
+    /// When it arrives the memory has changed, and this is asked again.
+    fn map_sparse(&self) {
+        let Some(host) = self.sparse.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let mut level = self.first;
+        while level < self.mips && !committed(self.memory, self.layout.bytes_from(level) as usize) {
+            level += 1;
+        }
+        if level < self.mips {
+            host.map_from(level);
+        }
+    }
+
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.map_sparse();
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1209,6 +1236,9 @@ fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32)
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
+    // Before the table's lock: the sweep of host copies takes the
+    // texture's lock and then this table's (`unstage`).
+    let sparse = crate::resource::sparse_copy(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
@@ -1281,6 +1311,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        sparse,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

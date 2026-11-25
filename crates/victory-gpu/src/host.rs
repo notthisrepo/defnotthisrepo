@@ -6025,6 +6025,13 @@ impl Host {
         }
     }
 
+    /// The queue, for what is put on it beside lists: the tile mappings
+    /// of sparse textures (`crate::sparse`), which take effect in the
+    /// queue's order.
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);

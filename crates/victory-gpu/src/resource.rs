@@ -556,14 +556,14 @@ fn twin_texture(
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
-            std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS))
+            std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS, None))
         })
     } else {
         None
     };
     TWINS[0].fetch_add(1, Relaxed);
     Some(std::sync::Arc::new(Twin {
-        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
+        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS, None)),
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
@@ -1120,11 +1120,14 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
-    /// The bytes the host gives it.
-    bytes: u64,
+    /// The bytes the host gives it (of a sparse one: so far).
+    bytes: std::sync::atomic::AtomicU64,
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// With a sparse texture (`crate::sparse`): which of its levels have
+    /// memory (the heaps are the texture object's own).
+    sparse: Option<crate::sparse::Sparse>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1303,7 +1306,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let Some((texture, sparse)) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1320,15 +1323,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             );
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
-        let mut host = HostTexture::new(texture, state);
+        let mut host = HostTexture::new(texture, state, sparse);
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
-            KINDS[1].fetch_add(host.bytes, Relaxed);
+            KINDS[1].fetch_add(host.bytes(), Relaxed);
         }
         if r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
-            KINDS[5].fetch_add(host.bytes, Relaxed);
+            KINDS[5].fetch_add(host.bytes(), Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
@@ -1433,7 +1436,7 @@ pub(crate) fn copy_state(this: This) -> Option<(u8, u64, u64)> {
     let memory = r.data() as u64;
     let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     Some(match made.as_ref() {
-        Some((host, _)) => (2, host.bytes, memory),
+        Some((host, _)) => (2, host.bytes(), memory),
         None => (u8::from(r.host.gone.load(Relaxed)), footprint(&r.desc).map_or(0, |f| f.size), memory),
     })
 }
@@ -1487,7 +1490,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             }
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             match made.as_ref() {
-                Some((host, _)) => copies.push((r.data() as usize, r.desc, host.bytes)),
+                Some((host, _)) => copies.push((r.data() as usize, r.desc, host.bytes())),
                 None => without[usize::from(r.host.gone.load(Relaxed))] += 1,
             }
         }
@@ -1499,6 +1502,13 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
     let video = crate::host::host().and_then(|h| h.video_memory());
     let noted_us = began.elapsed().as_micros() as u64;
+    if crate::sparse::on() {
+        let [made, tiles, heaps, refused] = crate::sparse::COUNTS.each_ref().map(|c| c.load(Relaxed));
+        tracing::info!(
+            "sparse host textures since the start: {made} made, {tiles} tiles mapped ({} MB) in {heaps} heaps, {refused} the host refused (made whole)",
+            (tiles * 64) >> 10
+        );
+    }
     let walk = move || {
         fn texels(m: &texture::Mip) -> u64 {
             u64::from(m.width) * u64::from(m.height) * u64::from(m.depth)
@@ -1668,9 +1678,9 @@ pub(crate) fn let_go_idle() {
         if let Some((host, _)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            KINDS[3].fetch_add(host.bytes(), Relaxed);
             went += 1;
-            bytes += host.bytes;
+            bytes += host.bytes();
             if first.is_none() {
                 first = Some(at);
             }
@@ -1714,8 +1724,8 @@ pub(crate) fn census() -> [u64; 10] {
             Some((host, twin)) => {
                 let kind = if host.filled { 4 } else { 0 };
                 count[kind] += 1;
-                count[kind + 1] += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
-                count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes);
+                count[kind + 1] += host.bytes() + twin.as_ref().map_or(0, |t| t.colour.bytes());
+                count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes());
                 let placed = r.host.placed.load(std::sync::atomic::Ordering::Relaxed);
                 if placed {
                     count[6] += 1;
@@ -1725,9 +1735,9 @@ pub(crate) fn census() -> [u64; 10] {
                     // Its first page: a texture's smallest mips lie there,
                     // and are mapped first and unmapped last.
                     if placed_filled.is_multiple_of(EVERY) && !crate::texture::committed(r.data().cast_const(), 1) {
-                        count[8] += host.bytes * EVERY;
+                        count[8] += host.bytes() * EVERY;
                         if crate::host::references(&host.texture) > 1 {
-                            count[9] += host.bytes * EVERY;
+                            count[9] += host.bytes() * EVERY;
                         }
                     }
                 }
@@ -1762,17 +1772,77 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    fn new(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+        sparse: Option<crate::sparse::Sparse>,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
-        let bytes = host_bytes(&texture);
+        // A sparse texture has no memory until levels of it are mapped.
+        let bytes = if sparse.is_some() { 0 } else { host_bytes(&texture) };
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
-            bytes,
+            bytes: std::sync::atomic::AtomicU64::new(bytes),
             filled: false,
+            sparse,
         }
+    }
+
+    /// The bytes of the card it takes now.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether it is a sparse texture (`crate::sparse`).
+    pub(crate) fn is_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
+    /// Of a sparse texture: gives the levels from `first` on the card's
+    /// memory, if they have none yet, before anything sent to the queue
+    /// from now on runs (`crate::sparse::Sparse::map_from`). Nothing for
+    /// any other texture.
+    pub(crate) fn map_from(&self, first: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(sparse) = &self.sparse else { return };
+        let Some(host) = crate::host::host() else { return };
+        let more = sparse.map_from(&host.device, host.queue(), &self.texture, first);
+        if more > 0 {
+            self.bytes.fetch_add(more, Relaxed);
+            HOST_TEXTURES[1].fetch_add(more, Relaxed);
+            if self.filled {
+                KINDS[1].fetch_add(more, Relaxed);
+            }
+        }
+    }
+}
+
+/// The host copy of title texture `this` if it is a sparse one, for its
+/// staging state to map levels of when it reads them
+/// (`crate::texture::Staging`): not held, so that the copy can be let go
+/// as idle. Asking is a use, as in [`host_resource`].
+#[cfg(windows)]
+pub(crate) fn sparse_copy(this: This) -> Option<std::sync::Weak<HostTexture>> {
+    if this.is_null() || !crate::sparse::on() {
+        return None;
+    }
+    let (host, _) = hosted(this, true)?;
+    host.is_sparse().then(|| std::sync::Arc::downgrade(&host))
+}
+
+/// The host is about to write title texture `this` itself (a copy, a
+/// resolve): if its host copy is sparse, every level gets memory first,
+/// since what the host writes is nowhere else.
+#[cfg(windows)]
+pub(crate) fn sparse_whole(this: This) {
+    if this.is_null() || !crate::sparse::on() {
+        return;
+    }
+    if let Some((host, _)) = hosted(this, true) {
+        host.map_from(0);
     }
 }
 
@@ -1780,11 +1850,12 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        let bytes = self.bytes();
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
-        HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        HOST_TEXTURES[1].fetch_sub(bytes, Relaxed);
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
-            KINDS[1].fetch_sub(self.bytes, Relaxed);
+            KINDS[1].fetch_sub(bytes, Relaxed);
         }
     }
 }
@@ -1843,7 +1914,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<crate::sparse::Sparse>)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -1893,6 +1964,20 @@ fn host_texture(
         }
         value
     });
+    // A large texture the title fills, level by level as it streams in:
+    // sparse, with memory for the levels read only (`crate::sparse`).
+    if crate::sparse::ready(&host.device) {
+        // SAFETY: the description has the host layout (checked size, same
+        // fields).
+        let pc = unsafe { &*(&raw const d).cast::<D3D12_RESOURCE_DESC>() };
+        if crate::sparse::wanted(pc) {
+            let state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+            if let Some((texture, sparse)) = crate::sparse::create(&host.device, pc, state) {
+                crate::host::name(&texture, || format!("sparse texture {}x{} f{}", d.width, d.height, d.format));
+                return Some((texture, Some(sparse)));
+            }
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1921,7 +2006,7 @@ fn host_texture(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|texture| (texture, None))
 }
 
 /// A texture's console memory and description; `None` for buffers.
