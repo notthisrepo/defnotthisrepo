@@ -853,6 +853,21 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if unlike(dst, src) {
                 return;
             }
+            // A copy of a texture onto itself: the title does it (the same
+            // texture as source and destination, seen in the world), and so
+            // would two title textures that share one host texture. The host
+            // cannot: the pair of state changes below left the texture a
+            // copy source, and the copy into it was an error (message 538 of
+            // the debug layer, 72 times in one run). On the console it
+            // leaves every byte as it was, so nothing is recorded, and it is
+            // said once.
+            if windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(?dst, ?src, "a copy of a host texture onto itself: nothing to copy")
+                });
+                return;
+            }
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {

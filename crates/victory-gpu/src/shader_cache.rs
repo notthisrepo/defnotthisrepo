@@ -22,13 +22,218 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in `dir` from now on.
+/// Keeps translated shaders under `dir` from now on, in a folder of this
+/// build's own ([`build_folder`]), and lets go of the folders of builds
+/// not used lately ([`stale`]).
+///
+/// Before, every build wrote into `dir` itself. An entry's key holds the
+/// build, so a rebuilt runtime could read none of the old ones, and
+/// nothing told them from the new: 8,872 entries and 503 MB after five
+/// builds in an evening, of which one build's 3,000 were of use.
 pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
+    let own = build_folder(build());
+    // Opened first: it refuses a folder inside the repository, and nothing
+    // is removed from a place that is not a cache.
+    match Cache::open(dir.join(&own)) {
         Ok(cache) => {
+            mark_used(&dir.join(&own));
+            let (removed, failed) = prune(&dir, &own);
+            if removed + failed > 0 {
+                tracing::info!(removed, failed, kept = KEPT_BUILDS, "shader cache: folders of other builds let go");
+            }
             let _ = CACHE.set(cache);
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
+    }
+}
+
+/// The builds whose folders are kept, this one included: a release and a
+/// diagnostics build, each with one set of translation switches besides
+/// the default.
+const KEPT_BUILDS: usize = 4;
+
+/// The file in a build's folder that holds when it was last used, in
+/// seconds since 1970.
+const LAST_USED: &str = "last-used";
+
+/// The name of a build's folder: `build-` and the first eight bytes of
+/// what identifies the build ([`build`]), in hex.
+fn build_folder(build: &[u8; 32]) -> String {
+    let hex: String = build[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("build-{hex}")
+}
+
+/// Whether `name` is `prefix` followed by exactly `digits` lower-case hex
+/// digits.
+fn hex_named(name: &str, prefix: &str, digits: usize) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|rest| rest.len() == digits && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Of the folders in the cache, each with when it was last used (0: not
+/// known), those to remove, `own` being this build's:
+///
+/// * the folders of the layout before builds had their own (two hex
+///   digits: the first byte of an entry's key), which no build reads any
+///   more;
+/// * builds' folders beyond the `keep` most lately used, `own` counted
+///   among those kept whatever its date.
+///
+/// A folder of any other name is not ours to remove.
+fn stale(folders: &[(String, u64)], own: &str, keep: usize) -> Vec<String> {
+    let mut remove: Vec<String> =
+        folders.iter().filter(|(name, _)| hex_named(name, "", 2)).map(|(name, _)| name.clone()).collect();
+    let mut builds: Vec<&(String, u64)> =
+        folders.iter().filter(|(name, _)| name != own && hex_named(name, "build-", 16)).collect();
+    // The most lately used first; among equals, by name, so that the same
+    // folders go whatever order the system lists them in.
+    builds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    remove.extend(builds.into_iter().skip(keep.saturating_sub(1)).map(|(name, _)| name.clone()));
+    remove
+}
+
+/// Notes in `folder` that it was used now.
+fn mark_used(folder: &std::path::Path) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if let Err(e) = std::fs::write(folder.join(LAST_USED), now.to_string()) {
+        tracing::debug!(error = %e, "shader cache: the folder's last use not noted");
+    }
+}
+
+/// Removes the folders of `dir` that [`stale`] names. Returns how many
+/// went and how many could not be removed (another run of ours may hold a
+/// file open; they go at a later start).
+fn prune(dir: &std::path::Path, own: &str) -> (usize, usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let folders: Vec<(String, u64)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let used = std::fs::read_to_string(e.path().join(LAST_USED)).ok().and_then(|s| s.trim().parse().ok());
+            Some((name, used.unwrap_or(0)))
+        })
+        .collect();
+    let (mut removed, mut failed) = (0, 0);
+    for name in stale(&folders, own, KEPT_BUILDS) {
+        match std::fs::remove_dir_all(dir.join(&name)) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::debug!(error = %e, folder = %name, "shader cache: a folder could not be removed");
+            }
+        }
+    }
+    (removed, failed)
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn folders(list: &[(&str, u64)]) -> Vec<(String, u64)> {
+        list.iter().map(|&(name, used)| (name.to_string(), used)).collect()
+    }
+
+    const A: &str = "build-00000000000000aa";
+    const B: &str = "build-00000000000000bb";
+    const C: &str = "build-00000000000000cc";
+    const D: &str = "build-00000000000000dd";
+    const E: &str = "build-00000000000000ee";
+
+    /// The old layout's folders always go; of the builds, this one and the
+    /// most lately used others stay, up to the number kept.
+    #[test]
+    fn old_layout_and_least_lately_used_builds_go() {
+        let all = folders(&[("00", 0), ("ff", 9), (A, 50), (B, 10), (C, 40), (D, 30), (E, 20), ("a7", 0)]);
+        let mut gone = stale(&all, B, 4);
+        gone.sort();
+        // B is this build (the oldest by date, kept all the same); A, C and
+        // D are the three others most lately used.
+        assert_eq!(gone, ["00", "a7", E, "ff"]);
+        assert!(stale(&all, B, 9).iter().all(|name| name.len() == 2), "room for every build: only the old layout goes");
+        let mut only_own = stale(&all, B, 1);
+        only_own.sort();
+        assert_eq!(only_own, ["00", "a7", A, C, D, E, "ff"]);
+    }
+
+    /// A folder that is neither of the two kinds is never removed, whatever
+    /// it looks like.
+    #[test]
+    fn folders_of_other_names_are_left_alone() {
+        let all = folders(&[
+            ("images", 0),
+            ("pipelines", 0),
+            ("0", 0),
+            ("abc", 0),
+            ("AB", 0),
+            ("zz", 0),
+            ("build-", 0),
+            ("build-123", 0),
+            ("build-00000000000000AA", 0),
+            ("build-00000000000000aaa", 0),
+            ("xbuild-00000000000000aa", 0),
+        ]);
+        assert!(stale(&all, A, 1).is_empty());
+    }
+
+    /// Builds with no date are the first to go, and the same ones whatever
+    /// order they are listed in.
+    #[test]
+    fn undated_builds_go_first_and_the_listing_order_does_not_matter() {
+        let one = folders(&[(B, 0), (C, 0), (D, 7)]);
+        let other = folders(&[(D, 7), (C, 0), (B, 0)]);
+        assert_eq!(stale(&one, A, 3), [C]);
+        assert_eq!(stale(&other, A, 3), [C]);
+        assert_eq!(stale(&one, A, 2), [B, C]);
+    }
+
+    /// The folder's name is the build's first eight bytes, in hex.
+    #[test]
+    fn a_builds_folder_is_named_by_its_first_eight_bytes() {
+        let mut build = [0u8; 32];
+        build[..9].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x55]);
+        assert_eq!(build_folder(&build), "build-0123456789abcdef");
+        assert!(hex_named(&build_folder(&build), "build-", 16));
+    }
+
+    /// On disk: stale folders are removed with what they hold, the others
+    /// and loose files stay, and this build's folder is dated.
+    #[test]
+    fn pruning_removes_exactly_the_stale_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let make = |name: &str, used: Option<u64>| {
+            let folder = dir.join(name);
+            std::fs::create_dir_all(folder.join("3f")).unwrap();
+            std::fs::write(folder.join("3f").join("entry"), b"x").unwrap();
+            if let Some(used) = used {
+                std::fs::write(folder.join(LAST_USED), used.to_string()).unwrap();
+            }
+        };
+        make("0a", None);
+        make("f3", None);
+        make(A, None);
+        make(B, Some(100));
+        make(C, Some(300));
+        make(D, Some(200));
+        make(E, Some(50));
+        make("pipelines", None);
+        std::fs::write(dir.join("a-file"), b"x").unwrap();
+        mark_used(&dir.join(A));
+        assert!(std::fs::read_to_string(dir.join(A).join(LAST_USED)).unwrap().parse::<u64>().unwrap() > 1_700_000_000);
+
+        // A is this build; of B, C, D, E the three most lately used stay.
+        assert_eq!(prune(dir, A), (3, 0));
+        let mut left: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["a-file", A, B, C, D, "pipelines"]);
+        assert!(dir.join(C).join("3f").join("entry").is_file());
+        // Nothing more to remove the second time.
+        assert_eq!(prune(dir, A), (0, 0));
     }
 }
 

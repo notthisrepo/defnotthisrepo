@@ -142,17 +142,66 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`, by default
+/// what [`card_defaults`] gives for the card's budget.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
+        let budget = host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let (least, most) = card_defaults(budget);
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let limits = (mb("VICTORY_CARD_BUFFERS_MIN_MB", least).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", most));
+        tracing::info!(
+            budget_mb = budget.map(|b| b >> 20),
+            least_mb = limits.0 >> 20,
+            most_mb = limits.1 >> 20,
+            "host copies in the card's memory: title buffers of least_mb or more, up to most_mb of them"
+        );
+        limits
     })
+}
+
+/// [`card_limits`]' defaults in MiB for a card whose memory budget is
+/// `budget` bytes (`None`: not known).
+///
+/// Under 12 GiB, or unknown: 16 and 512, as measured on an 8 GB card (run
+/// 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
+/// 1,650 MB of the card's budget free).
+///
+/// From 12 GiB on: every title buffer of 1 MiB or more, up to an eighth of
+/// the budget and at most 2,048 MiB. With 512 the ten biggest buffers took
+/// all of it on a 16 GB card too, and the smaller ones stayed on the CPU:
+/// 360-435 MB a frame snapshotted and compared there, 93% of it in copies
+/// of 1 MiB or more (the frame line's "shader writes looked for on the
+/// CPU"), with 5 GB of the card's budget unused. With 1 and 2,048 the CPU
+/// compared 27-30 MB a frame and the card held 1.5 GB of copies.
+fn card_defaults(budget: Option<u64>) -> (u64, u64) {
+    match budget {
+        Some(budget) if budget >= 12 << 30 => (1, ((budget >> 20) / 8).clamp(512, 2048)),
+        _ => (16, 512),
+    }
+}
+
+#[cfg(test)]
+mod card_default_tests {
+    use super::card_defaults;
+
+    /// The 8 GB card the limits were measured on keeps them, and so does a
+    /// card whose budget is not known; a big card takes small buffers too,
+    /// within an eighth of its budget and never more than 2 GiB.
+    #[test]
+    fn the_limits_grow_with_the_cards_budget_only_from_12_gib_on() {
+        assert_eq!(card_defaults(None), (16, 512));
+        assert_eq!(card_defaults(Some(0)), (16, 512));
+        assert_eq!(card_defaults(Some(7_200 << 20)), (16, 512));
+        assert_eq!(card_defaults(Some((12 << 30) - 1)), (16, 512));
+        assert_eq!(card_defaults(Some(12 << 30)), (1, 1536));
+        assert_eq!(card_defaults(Some(15_277 << 20)), (1, 1909));
+        assert_eq!(card_defaults(Some(24 << 30)), (1, 2048));
+        assert_eq!(card_defaults(Some(u64::MAX)), (1, 2048));
+    }
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -1385,6 +1434,12 @@ mod merge_tests {
 /// Host copies alive (also those only a list, a descriptor pass or a
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`LIVE`]: host copies alive and their bytes, for the overlay
+/// (`crate::overlay`).
+pub(crate) fn alive() -> (u64, u64) {
+    (LIVE[0].load(Ordering::Relaxed), LIVE[1].load(Ordering::Relaxed))
+}
 
 impl Drop for Shadow {
     fn drop(&mut self) {

@@ -118,6 +118,17 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+/// Shaders that did not translate, since the start: the draws of their
+/// pipelines are dropped.
+#[cfg(windows)]
+static UNTRANSLATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`UNTRANSLATED`], for the overlay (`crate::overlay`).
+#[cfg(windows)]
+pub(crate) fn untranslated() -> u64 {
+    UNTRANSLATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -159,12 +170,15 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        UNTRANSLATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                    }
                 }
                 done.ok()
             })

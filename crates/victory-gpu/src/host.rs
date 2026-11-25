@@ -381,7 +381,11 @@ fn card_clock_watch(clock: &'static CardClock) {
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+///
+/// Returns, per frame, the milliseconds the card had nothing of ours
+/// queued and those the submitting thread stood waiting for it (for the
+/// overlay, `crate::overlay`).
+fn card_clock_line(frames: f64, ms: f64) -> [f64; 2] {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
@@ -389,6 +393,21 @@ fn card_clock_line(frames: f64, ms: f64) {
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
         if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
     );
+    [idle, stood]
+}
+
+/// The process's private (committed) bytes and the bytes of it in the PC's
+/// memory, for the overlay.
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.PagefileUsage as u64, c.WorkingSetSize as u64)
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -545,7 +564,18 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // The adapter the system rates fastest, not the first one: on a
+            // PC with an integrated GPU the first may be that one. Software
+            // adapters are passed over; if none of the others takes the
+            // device, the system's default adapter is asked, as before.
+            for adapter in fast_adapters() {
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() && device.is_some() {
+                    break;
+                }
+            }
+            if device.is_none() {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -603,7 +633,19 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        tracing::info!("host D3D12 device ready");
+        // Which adapter the device is on, by name: a run on the wrong one
+        // (an integrated GPU, the software adapter) is otherwise told only
+        // by its frame rate.
+        match adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+            Some(desc) => tracing::info!(
+                adapter = %adapter_name(&desc.Description),
+                vendor = format_args!("{:#06x}", desc.VendorId),
+                dedicated_mb = desc.DedicatedVideoMemory >> 20,
+                software = software_adapter(desc.Flags),
+                "host D3D12 device ready"
+            ),
+            None => tracing::info!("host D3D12 device ready (its adapter is not named by the system)"),
+        }
         Ok(Host {
             device,
             queue,
@@ -620,6 +662,74 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// Whether an adapter with DXGI's `flags` is a software one.
+fn software_adapter(flags: u32) -> bool {
+    flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+}
+
+/// An adapter's name from DXGI's fixed field: up to the first NUL.
+fn adapter_name(description: &[u16]) -> String {
+    let end = description.iter().position(|&c| c == 0).unwrap_or(description.len());
+    String::from_utf16_lossy(&description[..end])
+}
+
+/// Of adapters in the order the system rates them, fastest first, each
+/// given by its DXGI flags: those to ask for a device, in that order (the
+/// software ones left out).
+fn hardware_in_order(flags: &[u32]) -> Vec<usize> {
+    (0..flags.len()).filter(|&i| !software_adapter(flags[i])).collect()
+}
+
+/// The hardware adapters, the one the system rates fastest first
+/// (`EnumAdapterByGpuPreference`, Windows 10 1803 and later). Empty where
+/// the system cannot say: the caller then asks for the default adapter.
+fn fast_adapters() -> Vec<IDXGIAdapter1> {
+    // SAFETY: plain DXGI factory and adapter queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return Vec::new();
+        };
+        let mut all = Vec::new();
+        while let Ok(adapter) =
+            factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(all.len() as u32, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+        {
+            all.push(adapter);
+        }
+        let flags: Vec<u32> = all.iter().map(|a| a.GetDesc1().map_or(DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, |d| d.Flags)).collect();
+        hardware_in_order(&flags).into_iter().map(|i| all[i].clone()).collect()
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    /// Software adapters are never asked; the others keep the system's
+    /// order, fastest first.
+    #[test]
+    fn hardware_adapters_keep_their_order_and_software_ones_are_left_out() {
+        let software = DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
+        assert_eq!(hardware_in_order(&[0, 0, software]), [0, 1]);
+        assert_eq!(hardware_in_order(&[software, 0]), [1]);
+        assert_eq!(hardware_in_order(&[software | 1, 1]), [1]);
+        assert!(hardware_in_order(&[software]).is_empty());
+        assert!(hardware_in_order(&[]).is_empty());
+    }
+
+    /// The name stops at the first NUL of DXGI's fixed field.
+    #[test]
+    fn an_adapters_name_ends_at_its_first_nul() {
+        let mut field = [0u16; 128];
+        for (to, from) in field.iter_mut().zip("Some GPU 9000".encode_utf16()) {
+            *to = from;
+        }
+        assert_eq!(adapter_name(&field), "Some GPU 9000");
+        assert_eq!(adapter_name(&[0u16; 128]), "");
+        let full: Vec<u16> = "ab".encode_utf16().collect();
+        assert_eq!(adapter_name(&full), "ab");
     }
 }
 
@@ -3433,7 +3543,24 @@ impl Host {
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
-        self.log_messages();
+        let first_error = self.log_messages();
+        // Diagnostics, as in `Host::execute`: after a message of GPU-based
+        // validation, the dispatches of the lists just landed.
+        #[cfg(feature = "diagnostics")]
+        if first_error.as_deref().is_some_and(|m| m.contains("GPU-BASED VALIDATION")) {
+            let lists: Vec<&HostList> =
+                landed.iter().flat_map(|(lists, order)| order.iter().map(|&i| lists[i].host())).collect();
+            for (l, list) in lists.iter().enumerate() {
+                let notes = list.notes.lock().unwrap_or_else(|e| e.into_inner());
+                let dispatches = notes.iter().filter(|(what, _)| what.starts_with("dispatch")).take(16);
+                for (n, (what, _)) in dispatches.enumerate() {
+                    let what: String = what.chars().take(900).collect();
+                    tracing::warn!(list = l, lists = lists.len(), dispatch = n, "after a GPU-based validation message, a dispatch of the lists just landed: {what}");
+                }
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = first_error;
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
             let mut line = line();
@@ -4136,7 +4263,26 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        self.log_messages();
+        let first_error = self.log_messages();
+        // Diagnostics, with device-removed data on (the lists then keep
+        // what each command does): GPU-based validation names a draw or
+        // dispatch by its number in its list and nothing else, so the
+        // dispatches of the lists just run are listed, each with its
+        // number, its pipeline and the views at the heap indices it is
+        // given.
+        #[cfg(feature = "diagnostics")]
+        if first_error.as_deref().is_some_and(|m| m.contains("GPU-BASED VALIDATION")) {
+            for (l, list) in runs.iter().enumerate() {
+                let notes = list.notes.lock().unwrap_or_else(|e| e.into_inner());
+                let dispatches = notes.iter().filter(|(what, _)| what.starts_with("dispatch")).take(16);
+                for (n, (what, _)) in dispatches.enumerate() {
+                    let what: String = what.chars().take(900).collect();
+                    tracing::warn!(list = l, lists = runs.len(), dispatch = n, "after a GPU-based validation message, a dispatch of the lists just run: {what}");
+                }
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = first_error;
         submitting(0, 0);
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_ends(lock);
@@ -5610,6 +5756,12 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// With the overlay (`crate::overlay`): a mapped upload buffer for
+    /// each list that presents (`copy` first, then `ahead`'s in their
+    /// order), its mapping's address and its bytes. A list is recorded
+    /// again only when its last flight has finished, so its buffer is
+    /// free to be written then.
+    overlay: Vec<Option<(ID3D12Resource, usize, u64)>>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -5623,6 +5775,9 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Host buffers made ([`MADE`]) when the overlay's figures were last
+    /// given: the next ones say how many were made since.
+    made: u64,
 }
 
 impl Meter {
@@ -5636,6 +5791,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            made: 0,
         }
     }
 
@@ -5679,7 +5835,53 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
-        card_clock_line(frames, ms);
+        let [card_idle, stood] = card_clock_line(frames, ms);
+        if crate::overlay::enabled() {
+            use crate::draw::{HEAP_TEXTURE_BYTES, HEAP_TEXTURES, HEAP_TEXTURES_AWAY, HEAP_TEXTURES_FULL, HEAP_TEXTURES_WAITING};
+            let (private, working) = process_memory();
+            let [budget, used, _, shared] = host().and_then(|h| h.video_memory()).unwrap_or_default();
+            let made = |i: usize| MADE[i].load(Ordering::Relaxed);
+            let buffers = made(0) + made(2) + made(4);
+            let (copies, copy_bytes) = crate::shadow::alive();
+            let (hits, misses) = crate::shader_cache::counts();
+            crate::overlay::publish(crate::overlay::Stats {
+                fps,
+                frame_ms: ms,
+                prepare_ms: cpu,
+                copy_ms,
+                texture_ms,
+                gpu_ms: gpu,
+                back_ms,
+                copy_mb,
+                texture_mb,
+                back_mb,
+                wait_ms: stood,
+                card_idle_ms: card_idle,
+                draws,
+                dropped,
+                dropped_indirect: indirect,
+                private_mb: private >> 20,
+                working_mb: working >> 20,
+                vram_mb: used >> 20,
+                vram_budget_mb: budget >> 20,
+                shared_mb: shared >> 20,
+                buffers,
+                buffers_mb: (made(1) + made(3) + made(5)) >> 20,
+                buffers_new: buffers - std::mem::replace(&mut self.made, buffers),
+                copies,
+                copies_mb: copy_bytes >> 20,
+                textures_up: HEAP_TEXTURES.load(Ordering::Relaxed),
+                textures_up_mb: HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
+                textures_waiting: HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
+                textures_unmapped: HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),
+                textures_no_room: HEAP_TEXTURES_FULL.load(Ordering::Relaxed),
+                views_refused: crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
+                shader_hits: hits,
+                shader_misses: misses,
+                shader_failures: crate::pipeline::untranslated(),
+                pipelines_making: crate::pipeline::making(),
+            });
+        }
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5752,7 +5954,8 @@ impl Meter {
                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
-                     {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
+                     {} ranges of memory mapped, unmapped or written under texture views ({} joined into wider ranges, the list \
+                     having filled {} times, {} of them while a pass was running), {} slots made due by them, \
                      {} made slots found unmapped and made null",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
@@ -5760,6 +5963,8 @@ impl Meter {
                     crate::descriptor::host::STALE[0].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
+                    crate::descriptor::host::WIDENED[0].load(Ordering::Relaxed),
+                    crate::descriptor::host::WIDENED[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
@@ -5944,6 +6149,13 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            if crate::overlay::enabled() {
+                let key = slot.map_or(0, |i| i + 1);
+                if p.overlay.len() <= key {
+                    p.overlay.resize(key + 1, None);
+                }
+                self.overlay(list, &back, format, (width, height), &mut p.overlay[key]);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -5978,6 +6190,81 @@ impl Host {
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
+        }
+    }
+
+    /// Records on `list` the copy of the overlay's pixels (`crate::overlay`)
+    /// over the top left of `back`, a back buffer of `format` and `size`
+    /// that is a copy destination just now. `kept` is the list's upload
+    /// buffer for them, made here when it is not there or too small; the
+    /// list's last run has finished (the caller recorded on it only then),
+    /// so nothing reads the buffer while it is written.
+    ///
+    /// Nothing is recorded, and said once, where it cannot be done: a back
+    /// buffer format the overlay has no pixels for, or no upload buffer.
+    ///
+    /// # Safety
+    /// `list` is open for recording and `back` is in the copy destination
+    /// state on it.
+    unsafe fn overlay(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        back: &ID3D12Resource,
+        format: DXGI_FORMAT,
+        size: (u32, u32),
+        kept: &mut Option<(ID3D12Resource, usize, u64)>,
+    ) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        let Some(pixel) = crate::overlay::Pixel::of(format.0) else {
+            SAID.call_once(|| tracing::warn!(format = format.0, "no overlay: it has no pixels for this back buffer format"));
+            return;
+        };
+        let Some(image) = crate::overlay::current(pixel) else {
+            // No figures yet: the first second of presenting.
+            return;
+        };
+        let Some((left, top, width, height)) = crate::overlay::placement(&image, size.0, size.1) else {
+            return;
+        };
+        let bytes = image.bytes.len() as u64;
+        if kept.as_ref().is_none_or(|(_, _, room)| *room < bytes) {
+            *kept = self.upload_buffer(bytes).map(|(buffer, data)| {
+                name(&buffer, || "overlay pixels".into());
+                (buffer, data as usize, bytes)
+            });
+        }
+        let Some((buffer, data, _)) = kept.as_ref() else {
+            SAID.call_once(|| tracing::warn!(bytes, "no overlay: no upload buffer for its pixels"));
+            return;
+        };
+        // SAFETY: the mapping holds at least `bytes` bytes, and the card is
+        // not reading it (see above). The copy locations borrow the two
+        // resources for the call, as `crate::capture` does.
+        unsafe {
+            std::ptr::copy_nonoverlapping(image.bytes.as_ptr(), *data as *mut u8, image.bytes.len());
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: format,
+                            Width: image.width,
+                            Height: image.height,
+                            Depth: 1,
+                            RowPitch: image.pitch,
+                        },
+                    },
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(back),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let part = D3D12_BOX { left: 0, top: 0, front: 0, right: width, bottom: height, back: 1 };
+            list.CopyTextureRegion(&to, left, top, 0, &from, Some(&part));
         }
     }
 
@@ -6022,6 +6309,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                overlay: Vec::new(),
             })
         }
     }

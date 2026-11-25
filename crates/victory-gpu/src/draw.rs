@@ -1779,6 +1779,14 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        // What the view heap's first slot holds: an index a shader reads
+        // from no user data (a constant, or one that came out as zero)
+        // shows nowhere above. GPU-based validation named slot 0 for a
+        // compute shader that expected a buffer there and found a 1D
+        // texture (reports/triage.md, C10).
+        if compute && let Some(slot) = views.and_then(|h| h.describe_slot(0)) {
+            let _ = write!(text, " [heap 0 holds: {slot}]");
+        }
         text
     }
 

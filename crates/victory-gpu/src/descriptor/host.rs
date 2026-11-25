@@ -201,8 +201,10 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
-/// ranges; and made slots whose memory was found unmapped (made null).
+/// ranges joined into wider ones because the list filled before a pass
+/// took them ([`widened`]; before, they were dropped); slots made due by
+/// such ranges; and made slots whose memory was found unmapped (made
+/// null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -237,12 +239,134 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        // The list is full: no pass took the ranges for a while (no shader
+        // that picks textures by index is bound), or more arrived between
+        // two passes than it holds. They were all dropped here, and a
+        // texture whose memory changed with no descriptor written stayed
+        // as it was until its slot came due by itself (65,536 ranges were
+        // dropped in a run of 1.6 million; whether in the world, nothing
+        // said). Now they are joined into fewer, wider ranges: the next
+        // pass looks at more slots than changed, and misses none.
+        let before = ranges.len();
+        *ranges = widened(std::mem::take(&mut *ranges), MOST / 2);
+        STALE[2].fetch_add((before - ranges.len()) as u64, Relaxed);
+        WIDENED[0].fetch_add(1, Relaxed);
+        // Whether a pass is running: it took the ranges within the last
+        // two frames.
+        let taken = TAKEN.load(Relaxed);
+        if taken != u64::MAX && crate::frame::current().saturating_sub(taken) <= 2 {
+            WIDENED[1].fetch_add(1, Relaxed);
+        }
     }
     ranges.push((start, end));
+}
+
+/// The frame in which a pass last took the ranges ([`remapped`],
+/// [`HostHeap::texture_slots_remapped`]); `u64::MAX` before the first.
+static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Since the start: times the list of ranges filled and was joined into
+/// wider ranges ([`widened`]), and of those the times a pass had taken the
+/// ranges within the two frames before (the list filled between passes,
+/// not for want of one).
+pub(crate) static WIDENED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// At most `most` ranges that hold every byte of `ranges`, in order and
+/// apart from each other: those that touch or overlap are joined, and
+/// while there are still too many, those with the smallest gaps between
+/// them (64 KiB first, then four times as much each round), the bytes of
+/// the gap included. What is added is memory that did not change: a pass
+/// given it looks at slots it need not have, and misses none.
+fn widened(mut ranges: Vec<(u64, u64)>, most: usize) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut gap = 0u64;
+    loop {
+        let mut joined: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for &(start, end) in &ranges {
+            match joined.last_mut() {
+                Some(last) if start <= last.1.saturating_add(gap) => last.1 = last.1.max(end),
+                _ => joined.push((start, end)),
+            }
+        }
+        // With the widest gap everything is one range.
+        if joined.len() <= most.max(1) || gap == u64::MAX {
+            return joined;
+        }
+        ranges = joined;
+        gap = if gap == 0 { 64 << 10 } else { gap.saturating_mul(4) };
+    }
+}
+
+#[cfg(test)]
+mod widened_tests {
+    use super::widened;
+
+    /// Every byte of every range given is in a range returned.
+    fn holds(wide: &[(u64, u64)], ranges: &[(u64, u64)]) -> bool {
+        ranges.iter().all(|&(start, end)| wide.iter().any(|&(a, b)| a <= start && end <= b))
+    }
+
+    /// In order, and neither touching nor overlapping.
+    fn apart(wide: &[(u64, u64)]) -> bool {
+        wide.iter().all(|&(a, b)| a < b) && wide.windows(2).all(|w| w[0].1 < w[1].0)
+    }
+
+    /// Ranges under the limit are only put in order and joined where they
+    /// touch or overlap: no byte is added.
+    #[test]
+    fn few_ranges_are_joined_only_where_they_touch() {
+        let ranges = vec![(300, 400), (0, 100), (100, 150), (120, 200), (1000, 1001)];
+        assert_eq!(widened(ranges.clone(), 8), [(0, 200), (300, 400), (1000, 1001)]);
+        assert_eq!(widened(ranges, 3), [(0, 200), (300, 400), (1000, 1001)]);
+        assert!(widened(Vec::new(), 4).is_empty());
+    }
+
+    /// Over the limit, the nearest ranges are joined first and the far
+    /// ones stay apart; nothing given is lost.
+    #[test]
+    fn too_many_ranges_are_joined_nearest_first() {
+        const K64: u64 = 64 << 10;
+        // Three ranges a page apart, and one a gigabyte away.
+        let ranges = vec![(0, 10), (K64 / 2, K64 / 2 + 10), (K64, K64 + 10), (1 << 30, (1 << 30) + 10)];
+        let wide = widened(ranges.clone(), 2);
+        assert_eq!(wide, [(0, K64 + 10), (1 << 30, (1 << 30) + 10)]);
+        assert!(holds(&wide, &ranges) && apart(&wide));
+        // One range allowed: everything from the first byte to the last.
+        assert_eq!(widened(ranges.clone(), 1), [(0, (1 << 30) + 10)]);
+        // A limit of none is taken as one.
+        assert_eq!(widened(ranges, 0), [(0, (1 << 30) + 10)]);
+    }
+
+    /// A full list of scattered ranges comes out within the limit, in
+    /// order, apart, and holding all that went in.
+    #[test]
+    fn a_full_list_fits_the_limit_and_loses_nothing() {
+        // 32,768 ranges of a page each, at scattered 64 KiB pages of a
+        // 512 GiB space (a fixed sequence: no random numbers in tests).
+        let mut at = 0x9e37_79b9_7f4a_7c15u64;
+        let ranges: Vec<(u64, u64)> = (0..1 << 15)
+            .map(|_| {
+                at = at.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let start = (at >> 41) << 16;
+                (start, start + 4096)
+            })
+            .collect();
+        for most in [1usize << 14, 1000, 7] {
+            let wide = widened(ranges.clone(), most);
+            assert!(wide.len() <= most, "{} ranges for a limit of {most}", wide.len());
+            assert!(apart(&wide));
+            assert!(holds(&wide, &ranges));
+        }
+    }
+
+    /// Ranges at the top of the address space do not wrap.
+    #[test]
+    fn ranges_at_the_end_of_the_address_space_do_not_wrap() {
+        let ranges = vec![(u64::MAX - 10, u64::MAX), (0, 5), (u64::MAX - 100_000, u64::MAX - 99_990)];
+        let wide = widened(ranges.clone(), 2);
+        assert_eq!(wide, [(0, 5), (u64::MAX - 100_000, u64::MAX)]);
+        assert!(holds(&wide, &ranges));
+    }
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -833,6 +957,8 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        // Noted whether or not there were any: a pass is running.
+        TAKEN.store(frame, Relaxed);
         if ranges.is_empty() {
             return 0;
         }
