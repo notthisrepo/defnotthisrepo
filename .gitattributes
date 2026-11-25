@@ -1,4 +1,7 @@
 # The repository is text-only by policy (see docs/asset-policy.md).
 * text=auto eol=lf
+# The example save (docs/asset-policy.md): bytes as they are.
+saves/company-cars-70pct/SARC0001 binary
+saves/company-cars-70pct/ps5-header.bin binary
 *.cmd text eol=crlf
 *.ps1 text eol=crlf

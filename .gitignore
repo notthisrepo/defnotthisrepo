@@ -47,6 +47,8 @@
 *.bin
 # The one exception (docs/asset-policy.md): the BCPack format's constant tables.
 !/crates/victory-formats/src/bcpack-tables.bin
+# This fork's exception (docs/asset-policy.md): the example save's header.
+!/saves/company-cars-70pct/ps5-header.bin
 *.dat
 *.pak
 *.rpf

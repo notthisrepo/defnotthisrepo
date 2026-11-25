@@ -28,10 +28,20 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+const EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "crates/victory-formats/src/bcpack-tables.bin",
+        "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    ),
+    (
+        "saves/company-cars-70pct/SARC0001",
+        "the example save this fork's test runs load, as published in ztrx-ps5-save-import (fork owner's decision, 2026-11-25; docs/asset-policy.md)",
+    ),
+    (
+        "saves/company-cars-70pct/ps5-header.bin",
+        "the example save's 368-byte header (fork owner's decision, 2026-11-25; docs/asset-policy.md)",
+    ),
+];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[

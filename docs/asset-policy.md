@@ -34,6 +34,16 @@ by the project owner's decision (2026-11-23), entered as an exception in
 repository's licence does not cover them. Nothing else of this kind is
 accepted.
 
+## This fork's exception
+
+`saves/company-cars-70pct/SARC0001` and `ps5-header.bin` (about 1.9 MB): an
+example story save, as published in ztrx-ps5-save-import, kept so that the
+fork's test runs can be repeated from the same place. It is data a copy of
+the title wrote, not part of the title and not our work; the repository's
+licence does not cover it. It is here by the fork owner's decision
+(2026-11-25), entered as exceptions in `xtask/src/policy.rs`. Upstream's
+rule stands for everything else.
+
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
