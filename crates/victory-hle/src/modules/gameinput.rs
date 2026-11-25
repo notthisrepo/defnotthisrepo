@@ -1152,11 +1152,21 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                let down = scripted();
+                for vk in &down {
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| key == vk) {
                         pad.buttons |= button;
                     }
                 }
+                // And its sticks and triggers, as the stand-in pad's
+                // keys move them: a test run walks the character.
+                let on = |vk: u8| if down.contains(&vk) { 1.0f32 } else { 0.0 };
+                pad.left_x = (pad.left_x + on(b'D') - on(b'A')).clamp(-1.0, 1.0);
+                pad.left_y = (pad.left_y + on(b'W') - on(b'S')).clamp(-1.0, 1.0);
+                pad.right_x = (pad.right_x + on(b'L') - on(b'J')).clamp(-1.0, 1.0);
+                pad.right_y = (pad.right_y + on(b'I') - on(b'K')).clamp(-1.0, 1.0);
+                pad.left_trigger = pad.left_trigger.max(on(b'Z'));
+                pad.right_trigger = pad.right_trigger.max(on(b'C'));
             }
             Some(pad)
         }
@@ -1199,15 +1209,20 @@ mod host {
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// 0.2 s that long after input starts, with or without focus;
+    /// `<seconds>:<key>:<held seconds>` holds it that long. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8, Duration)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
+                let (key, held) = match key.split_once(':') {
+                    Some((key, held)) => (key, Duration::try_from_secs_f64(held.trim().parse().ok()?).ok()?),
+                    None => (key, Duration::from_millis(200)),
+                };
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1225,6 +1240,7 @@ mod host {
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
+                    held,
                 ))
             });
             (Instant::now(), keys.collect())
@@ -1232,8 +1248,8 @@ mod host {
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, _, held)| (at..at + held).contains(&now))
+            .map(|&(_, vk, _)| vk)
             .collect()
     }
 
